@@ -1,6 +1,6 @@
 # dedupe-images
 
-Image dedup/normalization tools for `/mnt/dragonhoard/tuqiri/commissions`.
+Image dedup/normalization tools for a large, messy image collection.
 See `README.md` for what each script/mode does and how to run them.
 
 ## Structure

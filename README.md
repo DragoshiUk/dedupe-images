@@ -1,13 +1,11 @@
 # dedupe-images
 
-Tools for `/mnt/dragonhoard/tuqiri/commissions` (a flat root directory
-plus nested per-artist subdirectories, some of which contain identical
-files, some of which are themselves duplicated as sibling folders like
-`Foo`/`Foo_1`, and some of which have inconsistent letter casing). Note:
-this directory appears to be actively synced from elsewhere (mixed
-`dragoshi`/`onepassword-cli` ownership, new files showing up unprompted)
-— that's independent of these tools and not something they need to
-account for beyond not assuming the tree is static between runs.
+Tools for cleaning up a large, messy image collection: nested
+subdirectories, some containing identical files, some themselves
+duplicated as sibling folders (e.g. `Foo`/`Foo_1`), and inconsistent
+letter casing. Assumes the tree may change between runs (e.g. if it's
+being actively synced from elsewhere) — operations always rescan fresh
+rather than trusting a stale plan.
 
 **Start here: `review_gui.py`** — "Image Collection Super De-Duper", a
 local browser GUI covering three operations from one page: **Identical
@@ -32,9 +30,9 @@ folder. Both require an explicit tick before the button is even
 clickable, and say plainly that they cannot be undone.
 
 ```bash
-cd /home/dragoshi/Projects/dedupe-images
-uv run review_gui.py                                     # picker starts at $HOME
-uv run review_gui.py /mnt/dragonhoard/tuqiri/commissions  # scans immediately
+cd dedupe-images
+uv run review_gui.py                    # picker starts at $HOME
+uv run review_gui.py /path/to/images    # scans immediately
 ```
 
 ## Safety model (applies everywhere — GUI and CLI alike)
@@ -153,7 +151,7 @@ Pillow into an ephemeral environment automatically. Binds to `127.0.0.1`
 only, never reachable from the network.
 
 ```bash
-uv run review_gui.py /mnt/dragonhoard/tuqiri/commissions
+uv run review_gui.py /path/to/images
 # --threshold N     Visually-Similar Hamming distance out of 64, default 8
 # --port N          default 8765
 # --no-browser      don't try to auto-open a tab
@@ -165,10 +163,10 @@ The same four operations (minus interactive near-dup review, which needs
 a human looking at images) as a scriptable CLI. Dry-run by default:
 
 ```bash
-python3 dedupe_images.py /mnt/dragonhoard/tuqiri/commissions                                   # dry run
-python3 dedupe_images.py /mnt/dragonhoard/tuqiri/commissions --merge-dirs --lowercase           # dry run, all passes
-python3 dedupe_images.py /mnt/dragonhoard/tuqiri/commissions --merge-dirs --lowercase --execute # apply
-python3 dedupe_images.py /mnt/dragonhoard/tuqiri/commissions --restore                          # undo (GUI actions too)
+python3 dedupe_images.py /path/to/images                                   # dry run
+python3 dedupe_images.py /path/to/images --merge-dirs --lowercase           # dry run, all passes
+python3 dedupe_images.py /path/to/images --merge-dirs --lowercase --execute # apply
+python3 dedupe_images.py /path/to/images --restore                          # undo (GUI actions too)
 ```
 
 - `--merge-dirs` / `--lowercase` — enable those passes (file-level dedupe
@@ -205,7 +203,7 @@ a static report rather than the interactive reviewer. Never touches
 files.
 
 ```bash
-uv run find_near_duplicates.py /mnt/dragonhoard/tuqiri/commissions
+uv run find_near_duplicates.py /path/to/images
 # --threshold N, --montage-dir DIR, --no-montage
 ```
 
@@ -220,7 +218,7 @@ near-dup "Apply" button calls the same `build_apply_plan()`/`apply_plan()`
 functions this script uses, in-process, rather than shelling out.
 
 ```bash
-python3 apply_review.py /mnt/dragonhoard/tuqiri/commissions          # dry run
-python3 apply_review.py /mnt/dragonhoard/tuqiri/commissions --execute
+python3 apply_review.py /path/to/images          # dry run
+python3 apply_review.py /path/to/images --execute
 ```
 
