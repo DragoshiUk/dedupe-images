@@ -338,8 +338,16 @@ def upscale_one(path: Path, target: int, root: Path, out_dir: Path | None = None
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
+        # realesrgan-ncnn-vulkan mangles a -i path that contains a space
+        # (it truncates at the first one - "decode image foo failed").
+        # Feed it a space-free symlink to the real file instead.
+        staged = tmp / f"src{path.suffix.lower()}"
+        try:
+            staged.symlink_to(path.resolve())
+        except OSError:
+            shutil.copy2(path, staged)
         pass1 = tmp / "pass1.png"
-        _run_realesrgan(path, pass1, scale, binary, models_dir, cancel=cancel)
+        _run_realesrgan(staged, pass1, scale, binary, models_dir, cancel=cancel)
         source_for_resample = pass1
         if total_scale != scale:
             pass2 = tmp / "pass2.png"
