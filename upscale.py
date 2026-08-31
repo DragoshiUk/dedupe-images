@@ -9,7 +9,8 @@ aspect ratio, driven from the web UI.
 - Smaller than target: runs Real-ESRGAN (realesrgan-ncnn-vulkan, GPU) at
   the smallest integer factor (2/3/4x) that covers the gap, chaining a
   second 4x pass only for extreme scale-ups (>~6x), then one final
-  Lanczos3 resample to the *exact* target pixel count.
+  Lanczos3 resample to the *exact* target pixel count. Each GPU pass is
+  retried at smaller tile sizes if it runs out of VRAM (see TILE_LADDER).
 
 Output is a new file - by default "<name>_upscaled.<ext>" next to the
 original, or, when an output directory is chosen, the source tree
@@ -52,6 +53,10 @@ DEFAULT_TARGET = 4096
 MODEL = "realesrgan-x4plus-anime"
 DEFAULT_AFFIX = "_upscaled"
 AFFIX_POSITIONS = {"prefix", "suffix"}
+# realesrgan-ncnn-vulkan tile sizes to try, in order. 0 = its own VRAM
+# estimate (fast, one shot); on failure fall back to progressively smaller
+# fixed tiles so a big image succeeds on a modest GPU at some speed cost.
+TILE_LADDER = (0, 640, 384, 192, 96)
 
 # realesrgan-ncnn-vulkan can come from a system package (its models then
 # live in the shared dir below) or from the self-contained portable build
@@ -226,16 +231,16 @@ def pick_scale(needed: float) -> int:
     return 4
 
 
-def _run_realesrgan(infile: Path, outfile: Path, scale: int, binary: Path, models_dir: Path,
-                    cancel=None):
-    """One realesrgan-ncnn-vulkan pass. Polls so a cancel() request can
-    terminate the child mid-run (raises Cancelled). realesrgan-ncnn-vulkan
-    exits 0 even when it runs out of GPU memory and writes nothing, so a
-    missing output file is turned into a clear error rather than a cryptic
-    'No such file' later."""
+def _run_one_pass(infile: Path, outfile: Path, scale: int, tile: int,
+                  binary: Path, models_dir: Path, cancel) -> tuple[bool, str]:
+    """One realesrgan-ncnn-vulkan invocation. Polls so a cancel() request
+    can terminate the child (raises Cancelled). Returns (ok, last_stderr_line):
+    realesrgan-ncnn-vulkan frequently exits 0 even when it runs out of GPU
+    memory and writes nothing, so success means a non-empty output file."""
+    outfile.unlink(missing_ok=True)
     proc = subprocess.Popen(
-        [str(binary), "-i", str(infile), "-o", str(outfile),
-         "-n", MODEL, "-s", str(scale), "-m", str(models_dir)],
+        [str(binary), "-i", str(infile), "-o", str(outfile), "-n", MODEL,
+         "-s", str(scale), "-m", str(models_dir), "-t", str(tile)],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
     )
     while proc.poll() is None:
@@ -248,12 +253,27 @@ def _run_realesrgan(infile: Path, outfile: Path, scale: int, binary: Path, model
             raise Cancelled()
         time.sleep(0.15)
     stderr = (proc.stderr.read() if proc.stderr else "").strip()
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, str(binary), stderr=stderr)
-    if not outfile.exists():
-        tail = stderr.splitlines()[-1] if stderr else "no diagnostic output"
-        raise RuntimeError(f"realesrgan produced no output at {scale}x "
-                           f"(most likely out of GPU memory): {tail}")
+    ok = proc.returncode == 0 and outfile.exists() and outfile.stat().st_size > 0
+    reason = "" if ok else (stderr.splitlines()[-1] if stderr else f"exit {proc.returncode}, no output")
+    return ok, reason
+
+
+def _run_realesrgan(infile: Path, outfile: Path, scale: int, binary: Path, models_dir: Path,
+                    cancel=None):
+    """One upscale pass, retried at progressively smaller tile sizes if it
+    fails - the usual cause is the GPU running out of memory on a large
+    image. Raises RuntimeError if every tile size fails (image genuinely
+    too large for this GPU, or a driver problem)."""
+    reason = ""
+    for i, tile in enumerate(TILE_LADDER):
+        ok, reason = _run_one_pass(infile, outfile, scale, tile, binary, models_dir, cancel)
+        if ok:
+            return
+        if i + 1 < len(TILE_LADDER):
+            print(f"  · realesrgan {scale}x failed at tile={tile or 'auto'} ({reason}); "
+                  f"retrying at tile={TILE_LADDER[i + 1]}", file=sys.stderr)
+    raise RuntimeError(f"realesrgan failed at {scale}x even with small tiles "
+                       f"(image too large for this GPU, or a driver problem): {reason}")
 
 
 def _lanczos_resize(img: Image.Image, w: int, h: int, scale: float, dest: Path):
