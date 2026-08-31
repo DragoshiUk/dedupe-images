@@ -903,6 +903,13 @@ PAGE = r"""<!doctype html>
   .upscale-slider-row input[type=range] { flex:1; min-width:220px; accent-color:var(--accent); height:6px; cursor:pointer; }
   .upscale-target-value { color:var(--accent); font-weight:700; }
   .upscale-summary { color:var(--text-dim); font-size:13px; margin-bottom:14px; }
+  /* Start button sits top-right on its own row, just above the scroll box */
+  .upscale-run-row { display:flex; align-items:center; gap:12px; margin-bottom:12px; }
+  .upscale-run-row .upscale-summary { flex:1; min-width:0; margin-bottom:0; }
+  .upscale-run-row .spacer-note { color:var(--text-faint); font-size:12px; }
+  .upscale-run-row .btn { flex-shrink:0; }
+  /* Eligible-image list capped at ~5 rows (~72px each + 8px gap), then scrolls */
+  .upscale-thumb-scroll { max-height:400px; overflow-y:auto; padding:2px; }
   .upscale-opt-row { display:flex; align-items:center; gap:10px; padding:12px 18px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); margin-bottom:12px; flex-wrap:wrap; font-size:13px; }
   .upscale-opt-row > label:first-child { font-weight:600; font-size:13.5px; white-space:nowrap; }
   .upscale-opt-row input[type=text] { background:var(--bg); color:var(--text); border:1px solid var(--border-strong); border-radius:var(--radius-sm); padding:6px 9px; font-size:13px; }
@@ -2534,11 +2541,11 @@ function eligibleUpscaleImages(data, target) {
   return data.images.filter(im => im.longest < target && !upscaleNameIsAffixed(im.path));
 }
 
-// Only the summary/warning/list portion - deliberately never touches the
-// slider, options rows or Start button elements themselves, so re-running
-// this on every slider "input" event (i.e. continuously while dragging)
-// can't ever interrupt an in-progress drag by replacing the
-// <input type=range> out from under the browser's own drag handling.
+// The summary text (updated in place), and the warning + scrollable list
+// (rebuilt). Deliberately never touches the slider, options rows or Start
+// button elements themselves, so re-running this on every slider "input"
+// event (i.e. continuously while dragging) can't interrupt an in-progress
+// drag by replacing the <input type=range> out from under the browser.
 function updateUpscaleEligibleSection(data, target) {
   const section = document.getElementById('upscale-eligible-section');
   if (!section) return;
@@ -2550,11 +2557,13 @@ function updateUpscaleEligibleSection(data, target) {
     ? 'Set a filename prefix/suffix or a separate output directory first.' : '';
 
   const hiddenN = data.images.length - eligible.length;
-  let html = `<div class="upscale-summary">${plural(eligible.length, 'image')} below ${target}px on their longest side` +
+  const summaryEl = document.getElementById('upscale-summary');
+  if (summaryEl) summaryEl.innerHTML =
+    `${plural(eligible.length, 'image')} below ${target}px on their longest side` +
     (eligible.length ? ' - eligible for upscaling.' : '.') +
-    (hiddenN > 0 ? ` (${plural(hiddenN, 'other image')} not shown - already large enough, or an existing ${esc(upscaleAffix || '_upscaled')} output.)` : '') +
-    `</div>`;
+    (hiddenN > 0 ? ` (${plural(hiddenN, 'other image')} not shown - already large enough, or an existing ${esc(upscaleAffix || '_upscaled')} output.)` : '');
 
+  let html = '';
   if (eligible.length >= UPSCALE_WARN_THRESHOLD) {
     html += `<div class="warn-box warn-yellow"><b>${plural(eligible.length, 'image')} queued</b> - AI upscaling runs one image at a time on the GPU and can take anywhere from several seconds to over a minute per image depending on how much upscaling it needs. With this many eligible, running this could take a long time.</div>`;
   }
@@ -2565,7 +2574,7 @@ function updateUpscaleEligibleSection(data, target) {
     return;
   }
 
-  html += '<div class="thumb-grid">';
+  html += '<div class="thumb-grid upscale-thumb-scroll">';
   eligible.forEach(im => {
     const scale = target / im.longest;
     const newW = Math.max(1, Math.round(im.width * scale));
@@ -2627,11 +2636,12 @@ function renderUpscale(data) {
     <span class="dim">off: a file whose output already exists is skipped and reported, not replaced</span>
   </div>`;
 
-  html += `<div id="upscale-eligible-section"></div>
-  <div class="toolbar">
-    <button class="btn btn-primary btn-lg" id="upscale-start" ${data.tool_error ? 'disabled' : ''}>Start Upscale</button>
+  html += `<div class="upscale-run-row">
+    <div class="upscale-summary" id="upscale-summary"></div>
     <span class="spacer-note" id="upscale-start-hint"></span>
-  </div>`;
+    <button class="btn btn-primary btn-lg" id="upscale-start" ${data.tool_error ? 'disabled' : ''}>Start Upscale</button>
+  </div>
+  <div id="upscale-eligible-section"></div>`;
   panel.innerHTML = html;
   updateUpscaleEligibleSection(data, upscaleTarget);
 
