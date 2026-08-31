@@ -22,11 +22,13 @@ Upscale doesn't go through Pending Jobs/Quarantine at all - it never
 moves or deletes anything, it just writes a new file for any image whose
 longest side is under the slider's target resolution (up to 8192px/8K):
 beside the original by default, or into a chosen output directory (source
-sub-folders recreated), with a configurable prefix/suffix on the name.
-So there's no manifest/restore story for it and it has its own direct
-Start button. Needs realesrgan-ncnn-vulkan; if it's missing the command
-line says so at startup and the Upscale tab offers a one-click download
-of the portable build.
+sub-folders recreated), with a configurable prefix/suffix on the name. A
+file whose output path already exists is skipped and reported unless the
+"Overwrite existing upscaled files" box is ticked. So there's no
+manifest/restore story for it and it has its own direct Start button.
+Needs realesrgan-ncnn-vulkan; if it's missing the command line says so at
+startup and the Upscale tab offers a one-click download of the portable
+build.
 
 Nothing is deleted by a dedupe/merge/rename action itself - everything
 that would be removed is moved into _duplicates_quarantine/ with an entry
@@ -1220,6 +1222,14 @@ async function startAllTabLoads() {
   identicalData = null;
   normaliseData = null;
   upscaleData = null;
+  // Upscale settings are scoped to the collection they were set for - a
+  // previous root's output directory / affix / target must not steer the
+  // next one. Nulls make loadUpscale() re-pull the server defaults.
+  upscaleOutDir = null;
+  upscaleAffix = null;
+  upscaleAffixPos = 'suffix';
+  upscaleOverwrite = false;
+  upscaleTarget = null;
   ndGroups = [];
   ndDecisions = {};
   visualLoaded = false;
@@ -2441,20 +2451,32 @@ let upscaleTarget = null;    // slider value - null until the first load pulls d
 let upscaleAffix = null;     // filename affix text - null until the first load pulls default_affix
 let upscaleAffixPos = 'suffix';  // 'suffix' (append) | 'prefix' (prepend)
 let upscaleOutDir = null;    // null = alongside each original; else an absolute directory
+let upscaleOverwrite = false; // replace an output file that already exists, instead of skipping it
 let upscaleSliderDebounce = null;
 const UPSCALE_WARN_THRESHOLD = 15;  // eligible count at/above which the "this'll take a while" box shows
 
 // Matches the server-side guard: an empty affix only overwrites originals
 // when the copy also lands in the source location, so a separate output
-// directory makes an empty affix safe.
+// directory - one that isn't the scan root itself - makes an empty affix
+// safe.
 function upscaleOutputOk() {
-  return !!(upscaleAffix || upscaleOutDir);
+  const outDirDistinct = upscaleOutDir && upscaleOutDir !== currentRoot;
+  return !!(upscaleAffix || outDirDistinct);
 }
 
 // "photo.jpg" -> what the affix + position would name it
 function upscaleExampleName() {
   const a = upscaleAffix || '';
   return (upscaleAffixPos === 'prefix' ? a + 'photo' : 'photo' + a) + '.jpg';
+}
+
+// In alongside mode (no output dir), a file that already carries the affix
+// is a previous run's own output - server-side run_upscale skips it too,
+// so keep the eligible list in step.
+function upscaleNameIsAffixed(path) {
+  if (!upscaleAffix || upscaleOutDir) return false;
+  const stem = path.split('/').pop().replace(/\.[^./]*$/, '');
+  return upscaleAffixPos === 'prefix' ? stem.startsWith(upscaleAffix) : stem.endsWith(upscaleAffix);
 }
 
 async function loadUpscale() {
@@ -2477,7 +2499,7 @@ async function loadUpscale() {
 }
 
 function eligibleUpscaleImages(data, target) {
-  return data.images.filter(im => im.longest < target);
+  return data.images.filter(im => im.longest < target && !upscaleNameIsAffixed(im.path));
 }
 
 // Only the summary/warning/list portion - deliberately never touches the
@@ -2495,9 +2517,10 @@ function updateUpscaleEligibleSection(data, target) {
   if (hint) hint.textContent = (!data.tool_error && !upscaleOutputOk())
     ? 'Set a filename prefix/suffix or a separate output directory first.' : '';
 
+  const hiddenN = data.images.length - eligible.length;
   let html = `<div class="upscale-summary">${plural(eligible.length, 'image')} below ${target}px on their longest side` +
     (eligible.length ? ' - eligible for upscaling.' : '.') +
-    (data.images.length > eligible.length ? ` (${plural(data.images.length - eligible.length, 'other image')} already meet or exceed this size and ${data.images.length - eligible.length === 1 ? 'is' : 'are'} not shown.)` : '') +
+    (hiddenN > 0 ? ` (${plural(hiddenN, 'other image')} not shown - already large enough, or an existing ${esc(upscaleAffix || '_upscaled')} output.)` : '') +
     `</div>`;
 
   if (eligible.length >= UPSCALE_WARN_THRESHOLD) {
@@ -2505,7 +2528,7 @@ function updateUpscaleEligibleSection(data, target) {
   }
 
   if (eligible.length === 0) {
-    html += `<div class="empty">${data.images.length === 0 ? 'No images found in this directory.' : `Nothing below ${target}px - every image already meets or exceeds the target.`}</div>`;
+    html += `<div class="empty">${data.images.length === 0 ? 'No images found in this directory.' : `Nothing to upscale at ${target}px - every image is already at least that large, or is an existing ${esc(upscaleAffix || '_upscaled')} output.`}</div>`;
     section.innerHTML = html;
     return;
   }
@@ -2566,6 +2589,10 @@ function renderUpscale(data) {
       <option value="prefix"${upscaleAffixPos === 'prefix' ? ' selected' : ''}>Prepend (before name)</option>
     </select>
     <span class="dim">e.g. <code id="upscale-affix-example">photo.jpg &rarr; ${esc(upscaleExampleName())}</code></span>
+  </div>
+  <div class="upscale-opt-row">
+    <label style="font-weight:400;cursor:pointer"><input type="checkbox" id="upscale-overwrite" ${upscaleOverwrite ? 'checked' : ''}> Overwrite existing upscaled files</label>
+    <span class="dim">off: a file whose output already exists is skipped and reported, not replaced</span>
   </div>`;
 
   html += `<div id="upscale-eligible-section"></div>
@@ -2614,20 +2641,28 @@ function renderUpscale(data) {
   }
   affixInput.oninput = syncAffix;
   affixPos.onchange = syncAffix;
+  document.getElementById('upscale-overwrite').onchange = (e) => { upscaleOverwrite = e.target.checked; };
 
   document.getElementById('upscale-start').onclick = async () => {
     const eligible = eligibleUpscaleImages(upscaleData, upscaleTarget);
     const where = upscaleOutDir
       ? `into <code>${esc(upscaleOutDir)}</code> (source sub-folders recreated)`
       : 'next to each original';
+    const existing = upscaleOverwrite
+      ? '<p>An output file that already exists <b>will be overwritten</b>.</p>'
+      : '<p>A file whose output already exists is skipped (and reported), not replaced.</p>';
     confirmAction('Start upscaling',
       `<p>${plural(eligible.length, 'image')} below ${upscaleTarget}px will be upscaled to that size on their longest side, saved ${where} with <code>${esc(upscaleExampleName())}</code>-style names. Originals are never touched.</p>
+       ${existing}
        <p>This runs on the GPU and can take a while - the page shows progress as it goes.</p>`,
       async () => {
         const result = await runJob('Upscaling images&hellip;', '/api/upscale/run',
-          {target: upscaleTarget, out_dir: upscaleOutDir || '', affix: upscaleAffix, affix_pos: upscaleAffixPos});
+          {target: upscaleTarget, out_dir: upscaleOutDir || '', affix: upscaleAffix,
+           affix_pos: upscaleAffixPos, overwrite: upscaleOverwrite});
         if (result === null) return;
         let msg = `Upscaled ${plural(result.processed, 'image')}.`;
+        if (result.skipped && result.skipped.length)
+          msg += ` ${plural(result.skipped.length, 'image')} skipped - output already exists (tick "Overwrite existing upscaled files" to replace them).`;
         if (result.errors.length) msg += ` ${plural(result.errors.length, 'image')} failed - see the server console for details.`;
         alert(msg);
         loadUpscale();
@@ -3343,6 +3378,8 @@ def make_handler(state: State):
                     self._json({"ok": False, "error": "filename affix can't contain a path separator"}, status=400)
                     return
 
+                overwrite = bool(body.get("overwrite"))
+
                 out_raw = (body.get("out_dir") or "").strip()
                 out_dir = None
                 if out_raw:
@@ -3368,7 +3405,8 @@ def make_handler(state: State):
                     def cb(rel, i, total):
                         prog.phase_tick(0, f"Upscaling: {rel}", i, total)
                     return upscale.run_upscale(root, excludes, target, out_dir=out_dir,
-                                               affix=affix, affix_pos=affix_pos, on_progress=cb)
+                                               affix=affix, affix_pos=affix_pos,
+                                               overwrite=overwrite, on_progress=cb)
 
                 started = start_job("upscale", 1, work)
                 if not started:

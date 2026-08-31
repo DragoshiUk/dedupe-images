@@ -16,8 +16,8 @@ original, or, when an output directory is chosen, the source tree
 structure mirrored under it. The filename affix (default "_upscaled") and
 whether it's a prefix or a suffix are both configurable. Nothing is ever
 moved, deleted, or quarantined, so this has no manifest/restore
-involvement at all; re-running just overwrites the previous output for
-whichever originals are still under the target.
+involvement at all. A file whose output path already exists is skipped
+and reported, not silently overwritten, unless overwrite is set.
 """
 
 import os
@@ -124,9 +124,15 @@ def install_tool(on_log=None, on_bytes=None) -> None:
                              if not n.endswith("/") and n.startswith(prefix + "models/")]
             if not model_entries:
                 raise RuntimeError("archive contains no bundled models/ directory")
+            vendor_root = VENDOR_DIR.resolve()
             for n in [bin_entry, *model_entries]:
                 rel = n[len(prefix):]
                 dest = VENDOR_DIR / rel
+                # zip-slip guard: a ".." component only resolves at the OS
+                # layer, so check the resolved path still lands inside
+                # VENDOR_DIR before creating anything.
+                if not dest.resolve().is_relative_to(vendor_root):
+                    raise RuntimeError(f"archive entry {n!r} escapes the vendor directory")
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(n) as src, open(dest, "wb") as out:
                     shutil.copyfileobj(src, out)
@@ -175,6 +181,17 @@ def affixed_name(name: str, affix: str, affix_pos: str) -> str:
     return f"{stem}{p.suffix}"
 
 
+def is_affixed(name: str, affix: str, affix_pos: str) -> bool:
+    """True if `name`'s stem already carries `affix` in the chosen
+    position - used to skip a previous run's own output when it sits
+    alongside the sources (out_dir=None), so re-running can't chew on
+    "<name>_upscaled.jpg" and spit out "<name>_upscaled_upscaled.jpg"."""
+    if not affix:
+        return False
+    stem = Path(name).stem
+    return stem.startswith(affix) if affix_pos == "prefix" else stem.endswith(affix)
+
+
 def output_path(src: Path, root: Path, out_dir: Path | None,
                 affix: str, affix_pos: str) -> Path:
     """Where the upscaled copy of `src` is written. out_dir=None keeps it
@@ -213,16 +230,28 @@ def _lanczos_resize(img: Image.Image, w: int, h: int, scale: float, dest: Path):
     img.convert(mode).resize(new_size, Image.LANCZOS).save(dest)
 
 
+class OutputExists(Exception):
+    """The destination file already exists and overwrite wasn't requested -
+    a skip, not a failure. Carries the destination for reporting."""
+    def __init__(self, dest: Path):
+        super().__init__(f"output already exists: {dest}")
+        self.dest = dest
+
+
 def upscale_one(path: Path, target: int, root: Path, out_dir: Path | None = None,
-                affix: str = DEFAULT_AFFIX, affix_pos: str = "suffix", tool=None) -> Path:
+                affix: str = DEFAULT_AFFIX, affix_pos: str = "suffix",
+                overwrite: bool = False, tool=None) -> Path:
     """Processes a single image, returns the output path. Raises on
     failure (subprocess.CalledProcessError, OSError, ...) - callers
     processing a batch should catch per-file so one bad image doesn't
-    abort the rest. `tool` is a resolve_tool() result; resolved here if
-    omitted."""
+    abort the rest. Raises OutputExists (a skip, not a failure) when the
+    destination is already there and overwrite is False. `tool` is a
+    resolve_tool() result; resolved here if omitted."""
     dest = output_path(path, root, out_dir, affix, affix_pos)
     if dest.resolve() == path.resolve():
         raise ValueError(f"output path would overwrite the original: {path}")
+    if dest.exists() and not overwrite:
+        raise OutputExists(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     with Image.open(path) as img:
@@ -261,29 +290,44 @@ def upscale_one(path: Path, target: int, root: Path, out_dir: Path | None = None
     return dest
 
 
-def run_upscale(root: Path, exclude_dirs: set[Path], target: int, out_dir: Path | None = None,
-                affix: str = DEFAULT_AFFIX, affix_pos: str = "suffix", on_progress=None) -> dict:
-    """Recomputes the eligible list fresh (same "recompute immediately
-    before applying" approach used for Identical Files/Normalisation),
-    then upscales every eligible file in turn. Returns {"processed": N,
-    "errors": [{"path": rel, "error": str}, ...]}."""
+def eligible_candidates(root: Path, exclude_dirs: set[Path], target: int, out_dir: Path | None,
+                        affix: str, affix_pos: str) -> list[Path]:
+    """The paths run_upscale would actually process: under target on the
+    longest side, and - in alongside mode (out_dir=None) - not themselves
+    an already-affixed prior output."""
     scan_excludes = set(exclude_dirs)
     if out_dir is not None:
         scan_excludes.add(out_dir)  # never feed a previous run's own output back in
-    candidates = [p for p, w, h in iter_upscale_candidates(root, scan_excludes)
-                  if max(w, h) < target]
+    return [p for p, w, h in iter_upscale_candidates(root, scan_excludes)
+            if max(w, h) < target
+            and not (out_dir is None and is_affixed(p.name, affix, affix_pos))]
+
+
+def run_upscale(root: Path, exclude_dirs: set[Path], target: int, out_dir: Path | None = None,
+                affix: str = DEFAULT_AFFIX, affix_pos: str = "suffix",
+                overwrite: bool = False, on_progress=None) -> dict:
+    """Recomputes the eligible list fresh (same "recompute immediately
+    before applying" approach used for Identical Files/Normalisation),
+    then upscales every eligible file in turn. Returns {"processed": N,
+    "skipped": [{"path", "dest"}, ...], "errors": [{"path", "error"}, ...]}
+    - "skipped" is files whose output already existed and overwrite was off."""
+    candidates = eligible_candidates(root, exclude_dirs, target, out_dir, affix, affix_pos)
     tool = resolve_tool()
     total = len(candidates)
     processed = 0
+    skipped = []
     errors = []
     for i, p in enumerate(candidates, 1):
         rel = str(p.relative_to(root))
         if on_progress:
             on_progress(rel, i, total)
         try:
-            upscale_one(p, target, root, out_dir, affix, affix_pos, tool=tool)
+            upscale_one(p, target, root, out_dir, affix, affix_pos, overwrite=overwrite, tool=tool)
             processed += 1
+        except OutputExists as e:
+            print(f"  - skipped {rel} (output exists: {e.dest})", file=sys.stderr)
+            skipped.append({"path": rel, "dest": str(e.dest)})
         except Exception as e:
             print(f"  ! failed to upscale {rel}: {e}", file=sys.stderr)
             errors.append({"path": rel, "error": str(e)})
-    return {"processed": processed, "errors": errors}
+    return {"processed": processed, "skipped": skipped, "errors": errors}

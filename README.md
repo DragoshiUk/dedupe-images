@@ -143,6 +143,10 @@ its own Start button rather than through Pending Jobs. Two output options:
   (default `_upscaled`), and whether it goes before or after the name.
   Must be non-empty unless a separate output directory is set, so an
   upscaled file can never overwrite its original.
+- **Overwrite existing upscaled files** — off by default: a file whose
+  output path already exists is skipped and reported in the run summary,
+  never silently replaced (and in "alongside" mode a file that already
+  carries the affix isn't re-processed). Tick it to replace instead.
 
 Needs `realesrgan-ncnn-vulkan`. If it's missing, the command line says so
 at startup and the Upscale tab shows a **Download** button that fetches

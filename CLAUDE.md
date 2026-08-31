@@ -23,8 +23,10 @@ See `README.md` for what each script/mode does and how to run them.
   through quarantine": it's additive (writes a new file - affixed name
   and/or a separate output directory - never touches the original), so it
   has no manifest/restore involvement at all - don't try to route it
-  through the quarantine system. Its overwrite guard (empty affix is only
-  allowed alongside a separate output dir) is what keeps "additive" true.
+  through the quarantine system. Two things keep "additive" true and must
+  stay: the empty-affix guard (only allowed alongside a separate output
+  dir), and skipping any file whose output path already exists unless the
+  "Overwrite existing upscaled files" opt-in is ticked.
 - Keep `README.md` to what it is / how to use it / safety model — no
   debugging narrative, bug writeups, or changelog-style entries. Put
   that kind of detail in commit messages instead.
