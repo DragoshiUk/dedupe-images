@@ -8,8 +8,8 @@ aspect ratio, driven from the web UI.
   never helps when shrinking.
 - Smaller than target: runs Real-ESRGAN (realesrgan-ncnn-vulkan, GPU) at
   the smallest integer factor (2/3/4x) that covers the gap, chaining a
-  second 4x pass for extreme scale-ups, then one final Lanczos3 resample
-  down to the *exact* target pixel count.
+  second 4x pass only for extreme scale-ups (>~6x), then one final
+  Lanczos3 resample to the *exact* target pixel count.
 
 Output is a new file - by default "<name>_upscaled.<ext>" next to the
 original, or, when an output directory is chosen, the source tree
@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -32,6 +33,17 @@ from pathlib import Path
 from PIL import Image
 
 from find_near_duplicates import iter_images
+
+# These are the user's own local art files, not untrusted uploads - an
+# occasional genuinely large scan is legitimate, so lift PIL's
+# decompression-bomb ceiling that would otherwise abort it. (The common
+# case of a huge *intermediate* is handled by not over-chaining AI passes
+# - see upscale_one.)
+Image.MAX_IMAGE_PIXELS = None
+
+
+class Cancelled(Exception):
+    """Raised through a run when the caller asks it to stop."""
 
 UPSCALE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 MIN_TARGET = 512
@@ -214,12 +226,34 @@ def pick_scale(needed: float) -> int:
     return 4
 
 
-def _run_realesrgan(infile: Path, outfile: Path, scale: int, binary: Path, models_dir: Path):
-    subprocess.run(
+def _run_realesrgan(infile: Path, outfile: Path, scale: int, binary: Path, models_dir: Path,
+                    cancel=None):
+    """One realesrgan-ncnn-vulkan pass. Polls so a cancel() request can
+    terminate the child mid-run (raises Cancelled). realesrgan-ncnn-vulkan
+    exits 0 even when it runs out of GPU memory and writes nothing, so a
+    missing output file is turned into a clear error rather than a cryptic
+    'No such file' later."""
+    proc = subprocess.Popen(
         [str(binary), "-i", str(infile), "-o", str(outfile),
          "-n", MODEL, "-s", str(scale), "-m", str(models_dir)],
-        check=True, capture_output=True, text=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
     )
+    while proc.poll() is None:
+        if cancel and cancel():
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            raise Cancelled()
+        time.sleep(0.15)
+    stderr = (proc.stderr.read() if proc.stderr else "").strip()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, str(binary), stderr=stderr)
+    if not outfile.exists():
+        tail = stderr.splitlines()[-1] if stderr else "no diagnostic output"
+        raise RuntimeError(f"realesrgan produced no output at {scale}x "
+                           f"(most likely out of GPU memory): {tail}")
 
 
 def _lanczos_resize(img: Image.Image, w: int, h: int, scale: float, dest: Path):
@@ -240,24 +274,27 @@ class OutputExists(Exception):
 
 def upscale_one(path: Path, target: int, root: Path, out_dir: Path | None = None,
                 affix: str = DEFAULT_AFFIX, affix_pos: str = "suffix",
-                overwrite: bool = False, tool=None) -> Path:
+                overwrite: bool = False, tool=None, cancel=None) -> Path:
     """Processes a single image, returns the output path. Raises on
-    failure (subprocess.CalledProcessError, OSError, ...) - callers
-    processing a batch should catch per-file so one bad image doesn't
-    abort the rest. Raises OutputExists (a skip, not a failure) when the
-    destination is already there and overwrite is False. `tool` is a
-    resolve_tool() result; resolved here if omitted."""
+    failure (subprocess.CalledProcessError, RuntimeError, OSError, ...) -
+    callers processing a batch should catch per-file so one bad image
+    doesn't abort the rest. Raises OutputExists (a skip, not a failure)
+    when the destination is already there and overwrite is False, and
+    Cancelled if cancel() goes true mid-run. `tool` is a resolve_tool()
+    result; resolved here if omitted."""
     dest = output_path(path, root, out_dir, affix, affix_pos)
     if dest.resolve() == path.resolve():
         raise ValueError(f"output path would overwrite the original: {path}")
     if dest.exists() and not overwrite:
         raise OutputExists(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
 
+    # realesrgan-ncnn-vulkan writes the format its -o extension names; PNG
+    # is the safe universal for the intermediates regardless of source type.
     with Image.open(path) as img:
         w, h = img.size
         longest = max(w, h)
         if longest >= target:
+            dest.parent.mkdir(parents=True, exist_ok=True)
             _lanczos_resize(img, w, h, target / longest, dest)  # downscale, no AI
             return dest
 
@@ -270,21 +307,26 @@ def upscale_one(path: Path, target: int, root: Path, out_dir: Path | None = None
     scale = pick_scale(target / longest)
     total_scale = scale
 
-    # Chain a second 4x AI pass if a single pass still undershoots the
-    # target (e.g. 200px -> 4096px needs ~20x, beyond one 4x pass).
-    while longest * total_scale < target and total_scale < 16:
+    # Chain a second 4x AI pass only when one pass leaves the image so far
+    # below target that finishing with Lanczos would visibly soften it -
+    # i.e. still more than ~1.5x short. A small shortfall (a ~1000px source
+    # for a 4096 target lands at 4000px after 4x) is finished with a barely
+    # perceptible Lanczos nudge instead of a second 4x pass, which would
+    # otherwise blow the intermediate up to 16000px / ~200 megapixels.
+    while longest * total_scale * 1.5 < target and total_scale < 16:
         total_scale *= 4
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
-        pass1 = tmp / f"pass1{path.suffix}"
-        _run_realesrgan(path, pass1, scale, binary, models_dir)
+        pass1 = tmp / "pass1.png"
+        _run_realesrgan(path, pass1, scale, binary, models_dir, cancel=cancel)
         source_for_resample = pass1
         if total_scale != scale:
-            pass2 = tmp / f"pass2{path.suffix}"
-            _run_realesrgan(pass1, pass2, 4, binary, models_dir)
+            pass2 = tmp / "pass2.png"
+            _run_realesrgan(pass1, pass2, 4, binary, models_dir, cancel=cancel)
             source_for_resample = pass2
 
+        dest.parent.mkdir(parents=True, exist_ok=True)
         with Image.open(source_for_resample) as img:
             _lanczos_resize(img, img.width, img.height, target / longest / total_scale, dest)
     return dest
@@ -303,31 +345,57 @@ def eligible_candidates(root: Path, exclude_dirs: set[Path], target: int, out_di
             and not (out_dir is None and is_affixed(p.name, affix, affix_pos))]
 
 
+def _display_out(dest: Path, root: Path, out_dir: Path | None) -> str:
+    """A short, recognisable name for an output file - relative to the
+    output directory when there is one, else to the scan root."""
+    base = out_dir if out_dir is not None else root
+    try:
+        return str(dest.relative_to(base))
+    except ValueError:
+        return dest.name
+
+
 def run_upscale(root: Path, exclude_dirs: set[Path], target: int, out_dir: Path | None = None,
-                affix: str = DEFAULT_AFFIX, affix_pos: str = "suffix",
-                overwrite: bool = False, on_progress=None) -> dict:
+                affix: str = DEFAULT_AFFIX, affix_pos: str = "suffix", overwrite: bool = False,
+                cancel=None, on_progress=None, on_done=None) -> dict:
     """Recomputes the eligible list fresh (same "recompute immediately
     before applying" approach used for Identical Files/Normalisation),
-    then upscales every eligible file in turn. Returns {"processed": N,
-    "skipped": [{"path", "dest"}, ...], "errors": [{"path", "error"}, ...]}
-    - "skipped" is files whose output already existed and overwrite was off."""
+    then upscales every eligible file in turn. on_progress(rel, i, total)
+    fires before each file; on_done({"path","out","status"[,"error"]})
+    fires after each (status: "ok" | "skipped" | "error"). cancel() is
+    polled between and within files. Returns {"processed": N, "skipped":
+    [...], "errors": [...], "cancelled": bool}."""
     candidates = eligible_candidates(root, exclude_dirs, target, out_dir, affix, affix_pos)
     tool = resolve_tool()
     total = len(candidates)
     processed = 0
     skipped = []
     errors = []
+    cancelled = False
     for i, p in enumerate(candidates, 1):
+        if cancel and cancel():
+            cancelled = True
+            break
         rel = str(p.relative_to(root))
         if on_progress:
             on_progress(rel, i, total)
         try:
-            upscale_one(p, target, root, out_dir, affix, affix_pos, overwrite=overwrite, tool=tool)
+            out = upscale_one(p, target, root, out_dir, affix, affix_pos,
+                              overwrite=overwrite, tool=tool, cancel=cancel)
             processed += 1
+            if on_done:
+                on_done({"path": rel, "out": _display_out(out, root, out_dir), "status": "ok"})
+        except Cancelled:
+            cancelled = True
+            break
         except OutputExists as e:
             print(f"  - skipped {rel} (output exists: {e.dest})", file=sys.stderr)
             skipped.append({"path": rel, "dest": str(e.dest)})
+            if on_done:
+                on_done({"path": rel, "out": _display_out(e.dest, root, out_dir), "status": "skipped"})
         except Exception as e:
             print(f"  ! failed to upscale {rel}: {e}", file=sys.stderr)
             errors.append({"path": rel, "error": str(e)})
-    return {"processed": processed, "skipped": skipped, "errors": errors}
+            if on_done:
+                on_done({"path": rel, "out": None, "status": "error", "error": str(e)})
+    return {"processed": processed, "skipped": skipped, "errors": errors, "cancelled": cancelled}

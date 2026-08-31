@@ -149,6 +149,13 @@ its own Upscale button rather than through Pending Jobs. Options:
   silently replaced (and in "alongside" mode a file that already ends with
   the append text isn't re-processed). Tick it to replace instead.
 
+While a run is going the rest of the app is locked (the tabs and directory
+switcher are disabled, the sub-tab shows a spinner) and the Upscale pane
+becomes a live list of finished/skipped/failed outputs. Progress shows in
+the bottom status bar, not a modal. **Stop Upscaling** — in the same spot
+the Upscale button was — cancels the run, killing the in-flight GPU
+process; whatever finished before that is kept.
+
 Needs `realesrgan-ncnn-vulkan`. If it's missing, the command line says so
 at startup and the Upscale tab shows a **Download** button that fetches
 the self-contained portable build (binary + models, ~45 MB) into

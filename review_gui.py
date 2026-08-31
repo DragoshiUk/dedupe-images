@@ -169,7 +169,9 @@ class Progress:
         self.total = 1
         self.error = None
         self.done_result = None
-        self.log = []  # bounded human-readable lines, for jobs that stream output
+        self.log = []       # bounded human-readable lines, for jobs that stream output
+        self.detail = []    # structured per-item results, for jobs that report them
+        self._cancel = threading.Event()
 
     def begin(self, kind: str, phase_count: int):
         with self.lock:
@@ -183,12 +185,26 @@ class Progress:
             self.error = None
             self.done_result = None
             self.log = []
+            self.detail = []
+        self._cancel.clear()
 
     def log_line(self, text: str):
         """Append a line to the job's rolling output log (last 200 kept)."""
         with self.lock:
             self.log.append(text)
             del self.log[:-200]
+
+    def add_detail(self, item: dict):
+        """Record one per-item result (last 10000 kept)."""
+        with self.lock:
+            self.detail.append(item)
+            del self.detail[:-10000]
+
+    def request_cancel(self):
+        self._cancel.set()
+
+    def cancel_requested(self) -> bool:
+        return self._cancel.is_set()
 
     def phase_tick(self, index: int, name: str, current: int, total: int = 1):
         with self.lock:
@@ -215,7 +231,8 @@ class Progress:
                 "phase_index": self.phase_index, "phase_count": self.phase_count,
                 "current": self.current, "total": self.total, "pct": max(0, min(pct, 100)),
                 "error": self.error, "done": (not self.active) and (self.done_result is not None or self.error is not None),
-                "result": self.done_result, "log": list(self.log),
+                "result": self.done_result, "log": list(self.log), "detail": list(self.detail),
+                "cancel_requested": self._cancel.is_set(),
             }
 
 
@@ -918,6 +935,19 @@ PAGE = r"""<!doctype html>
   /* Eligible-image list fills to the bottom of the viewport (max-height set
      from JS on render + resize); the CSS value is just a pre-JS fallback. */
   .upscale-thumb-scroll { max-height:60vh; overflow-y:auto; padding:2px; }
+  /* ---------- upscale run in progress ---------- */
+  .upscale-out-list { display:flex; flex-direction:column; gap:4px; font-size:12.5px; }
+  .upscale-out-row { display:flex; align-items:center; gap:12px; padding:6px 10px; border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface); }
+  .upscale-out-row .path { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .upscale-out-row .tag { flex-shrink:0; font-size:11px; color:var(--text-faint); }
+  .upscale-out-row.ok .tag { color:var(--success); }
+  .upscale-out-row.skip { opacity:.65; }
+  .upscale-out-row.err { border-color:var(--danger-border); background:var(--danger-bg); }
+  .upscale-out-row.err .tag { color:var(--danger); }
+  /* whole webui frozen except the Stop button while a run is going */
+  body.upscale-running #tabs, body.upscale-running #change-dir, body.upscale-running #subtabs { pointer-events:none; }
+  body.upscale-running #tabs, body.upscale-running #change-dir { opacity:.4; }
+  body.upscale-running #subtabs button:not(.active) { opacity:.4; }
   .job-log { text-align:left; margin:14px 0 0; max-height:190px; overflow-y:auto; background:var(--bg); border:1px solid var(--border); border-radius:var(--radius-sm); padding:10px 12px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px; line-height:1.5; color:var(--text-dim); white-space:pre-wrap; word-break:break-all; }
   .warn-box { background:var(--danger-bg); border:1px solid var(--danger-border); border-radius:var(--radius); padding:14px 16px; color:#f2b6b9; font-size:13px; margin-bottom:12px; }
   .warn-box b { color:#ffcdcf; }
@@ -1366,9 +1396,10 @@ async function pollScan() {
       }
       setSmallSpinner('visual', !p.done);  // stays lit through scoring too, only clears once the whole scan is done
       if (!stillInHashPhase) {
-        if (p.active) {
+        // an upscale run owns the status bar while it's going
+        if (p.active && !upscaleRunning) {
           showStatusBar(`Scoring images for review: ${plural(p.current, 'group')} ready`, p.pct);
-        } else if (p.done) {
+        } else if (p.done && !upscaleRunning) {
           showStatusBar('Scan complete', 100);
         }
         // The first time content becomes available this scan, do a real
@@ -1380,7 +1411,7 @@ async function pollScan() {
       }
       if (p.done) {
         await refreshVisualGroupsQuietly();
-        setTimeout(hideStatusBar, 1500);
+        setTimeout(() => { if (!upscaleRunning) hideStatusBar(); }, 1500);
         break;
       }
       await new Promise(res => setTimeout(res, 500));
@@ -1637,6 +1668,7 @@ document.querySelectorAll('#subtabs button').forEach(btn => {
 // go stale - if the header ever disagrees with what a tab shows, this is
 // the fix: every tab switch re-derives state from /api/state fresh.
 async function reloadActive() {
+  if (upscaleRunning) return;  // the run owns the Upscale pane; nav is frozen anyway
   await refreshRootLabel();
   if (!currentRoot) {
     // NOTE: #tab-operations is a .tabpanel that is also the *parent* of the
@@ -2495,6 +2527,8 @@ let upscaleAffix = null;     // text appended to each output filename - null unt
 let upscaleOutDir = null;    // null = alongside each original; else an absolute directory
 let upscaleOverwrite = false; // replace an output file that already exists, instead of skipping it
 let upscaleSliderDebounce = null;
+let upscaleRunning = false;   // an upscale job is in progress - the whole webui is frozen except Stop
+let upscaleRenderedCount = 0; // detail rows already appended to the in-progress list
 const UPSCALE_WARN_THRESHOLD = 15;  // eligible count at/above which the "this'll take a while" box shows
 
 // Matches the server-side guard: an empty affix only overwrites originals
@@ -2526,7 +2560,7 @@ function sizeUpscaleScroll() {
 }
 
 async function loadUpscale() {
-  if (tabLoading.upscale) return;  // already in flight (e.g. from startAllTabLoads) - avoid an overlapping duplicate fetch
+  if (tabLoading.upscale || upscaleRunning) return;  // in flight, or a run owns the pane
   setTabLoading('upscale', true, 'Scanning');
   try {
     const q = upscaleOutDir ? `?out_dir=${encodeURIComponent(upscaleOutDir)}` : '';
@@ -2642,7 +2676,7 @@ function renderUpscale(data) {
 
   const installBtn = document.getElementById('upscale-install');
   if (installBtn) installBtn.onclick = async () => {
-    const result = await runJob('Downloading realesrgan-ncnn-vulkan&hellip;', '/api/upscale/install', {});
+    const result = await runJob('Downloading realesrgan-ncnn-vulkan…', '/api/upscale/install', {});
     if (result === null) return;  // runJob already alerted
     alert('realesrgan-ncnn-vulkan installed. See the log for any warnings (e.g. a missing Vulkan driver).');
     loadUpscale();
@@ -2669,36 +2703,153 @@ function renderUpscale(data) {
     updateUpscaleEligibleSection(upscaleData, upscaleTarget);  // Start disabled/hint depend on the append text
   };
   document.getElementById('upscale-overwrite').onchange = (e) => { upscaleOverwrite = e.target.checked; };
+  document.getElementById('upscale-start').onclick = confirmAndStartUpscale;
+}
 
-  document.getElementById('upscale-start').onclick = async () => {
-    const eligible = eligibleUpscaleImages(upscaleData, upscaleTarget);
-    const where = upscaleOutDir
-      ? `into <code>${esc(upscaleOutDir)}</code> (source sub-folders recreated)`
-      : 'next to each original';
-    const naming = upscaleAffix
-      ? `with "<code>${esc(upscaleAffix)}</code>" appended to each name`
-      : 'keeping the same filename';
-    const existing = upscaleOverwrite
-      ? '<p>An output file that already exists <b>will be overwritten</b>.</p>'
-      : '<p>A file whose output already exists is skipped (and reported), not replaced.</p>';
-    confirmAction('Start upscaling',
-      `<p>${plural(eligible.length, 'image')} below ${upscaleTarget}px will be upscaled to that size on their longest side, saved ${where} ${naming}. Originals are never touched.</p>
-       ${existing}
-       <p>This runs on the GPU and can take a while - the page shows progress as it goes.</p>`,
-      async () => {
-        const result = await runJob('Upscaling images&hellip;', '/api/upscale/run',
-          {target: upscaleTarget, out_dir: upscaleOutDir || '', affix: upscaleAffix,
-           affix_pos: 'suffix', overwrite: upscaleOverwrite});
-        if (result === null) return;
-        let msg = `Upscaled ${plural(result.processed, 'image')}.`;
-        if (result.skipped && result.skipped.length)
-          msg += ` ${plural(result.skipped.length, 'image')} skipped - output already exists (tick "Overwrite Existing" to replace them).`;
-        if (result.errors.length) msg += ` ${plural(result.errors.length, 'image')} failed - see the server console for details.`;
-        alert(msg);
-        loadUpscale();
-      },
-      {confirmLabel: 'Start'});
-  };
+// ---------- upscale: run in progress ----------
+//
+// While a run is going the whole webui is frozen (body.upscale-running
+// disables the tabs / directory switcher) and the Upscale pane is replaced
+// by a live list of outputs plus a Stop button where "Upscale" was. All
+// progress goes to the bottom status bar - no modal.
+
+function confirmAndStartUpscale() {
+  const eligible = eligibleUpscaleImages(upscaleData, upscaleTarget);
+  const where = upscaleOutDir
+    ? `into <code>${esc(upscaleOutDir)}</code> (source sub-folders recreated)`
+    : 'next to each original';
+  const naming = upscaleAffix
+    ? `with "<code>${esc(upscaleAffix)}</code>" appended to each name`
+    : 'keeping the same filename';
+  const existing = upscaleOverwrite
+    ? '<p>An output file that already exists <b>will be overwritten</b>.</p>'
+    : '<p>A file whose output already exists is skipped (and reported), not replaced.</p>';
+  confirmAction('Start upscaling',
+    `<p>${plural(eligible.length, 'image')} below ${upscaleTarget}px will be upscaled to that size on their longest side, saved ${where} ${naming}. Originals are never touched.</p>
+     ${existing}
+     <p>The rest of the app is locked while this runs; use <b>Stop Upscaling</b> to cancel.</p>`,
+    async () => {
+      const r = await fetch('/api/upscale/run', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({target: upscaleTarget, out_dir: upscaleOutDir || '',
+          affix: upscaleAffix, affix_pos: 'suffix', overwrite: upscaleOverwrite}),
+      });
+      const started = await r.json();
+      if (!started.ok) { alert(started.error || 'could not start upscaling'); return; }
+      enterUpscaleRunning();
+      pollUpscale();
+    },
+    {confirmLabel: 'Start'});
+}
+
+function enterUpscaleRunning() {
+  upscaleRunning = true;
+  upscaleRenderedCount = 0;
+  document.body.classList.add('upscale-running');
+  setSmallSpinner('upscale', true);
+  showStatusBar('Upscaling — starting…', 0);
+  renderUpscaleRunning();
+}
+
+function exitUpscaleRunning() {
+  upscaleRunning = false;
+  document.body.classList.remove('upscale-running');
+  setSmallSpinner('upscale', false);
+  hideStatusBar();
+}
+
+function renderUpscaleRunning() {
+  const panel = document.getElementById('sub-upscale');
+  panel.innerHTML = `<h2 class="page-title">Upscale</h2>
+    <div class="upscale-run-row">
+      <div class="upscale-summary" id="upscale-run-summary">Starting…</div>
+      <button class="btn btn-danger btn-lg" id="upscale-stop">Stop Upscaling</button>
+    </div>
+    <div class="upscale-out-list upscale-thumb-scroll" id="upscale-out-list">
+      <div class="empty">No images processed yet…</div>
+    </div>`;
+  document.getElementById('upscale-stop').onclick = stopUpscale;
+  sizeUpscaleScroll();
+}
+
+function upscaleOutRow(d) {
+  const cls = d.status === 'error' ? 'err' : d.status === 'skipped' ? 'skip' : 'ok';
+  const tag = d.status === 'error' ? esc(d.error || 'failed')
+    : d.status === 'skipped' ? 'skipped — output exists' : 'done';
+  return `<div class="upscale-out-row ${cls}"><span class="path">${esc(d.out || d.path)}</span><span class="tag">${tag}</span></div>`;
+}
+
+function applyUpscaleProgress(p) {
+  const sum = document.getElementById('upscale-run-summary');
+  const detail = p.detail || [];
+  const ok = detail.filter(d => d.status === 'ok').length;
+  const failed = detail.filter(d => d.status === 'error').length;
+  const skip = detail.filter(d => d.status === 'skipped').length;
+  if (sum) {
+    let t = p.total ? `Upscaling ${p.current} / ${p.total}` : 'Upscaling…';
+    if (p.phase) t += ` — ${p.phase}`;
+    sum.textContent = t;
+  }
+  let bar = p.total ? `${p.current} / ${p.total} images` : 'starting…';
+  const extra = [failed && `${failed} failed`, skip && `${skip} skipped`].filter(Boolean).join(' · ');
+  showStatusBar('Upscaling: ' + bar + (extra ? ' · ' + extra : ''), p.pct);
+
+  const list = document.getElementById('upscale-out-list');
+  if (list && detail.length > upscaleRenderedCount) {
+    if (upscaleRenderedCount === 0) list.innerHTML = '';
+    const atBottom = list.scrollTop + list.clientHeight >= list.scrollHeight - 8;
+    let add = '';
+    for (let i = upscaleRenderedCount; i < detail.length; i++) add += upscaleOutRow(detail[i]);
+    list.insertAdjacentHTML('beforeend', add);
+    upscaleRenderedCount = detail.length;
+    if (atBottom) list.scrollTop = list.scrollHeight;
+  }
+}
+
+async function pollUpscale() {
+  let fails = 0;
+  while (upscaleRunning) {
+    let p;
+    try {
+      const r = await fetch('/api/progress');
+      p = await r.json();
+      fails = 0;
+    } catch (e) {
+      if (++fails >= 10) {  // ~7s of no contact - don't leave the UI frozen forever
+        exitUpscaleRunning();
+        alert('Lost contact with the server. The upscale may still be running - check the terminal. Reload the page to reconnect.');
+        return;
+      }
+      await new Promise(res => setTimeout(res, 700));
+      continue;  // transient - the job keeps running server-side
+    }
+    if (p.kind === 'upscale' || p.done) applyUpscaleProgress(p);
+    if (p.done) {
+      const res = p.result || {};
+      exitUpscaleRunning();
+      let msg;
+      if (p.error) msg = 'Upscaling failed: ' + p.error;
+      else if (res.cancelled) msg = `Upscaling stopped. ${res.processed || 0} done before stopping`
+        + ((res.errors && res.errors.length) ? `, ${res.errors.length} failed` : '') + '.';
+      else {
+        msg = `Upscaled ${plural(res.processed || 0, 'image')}.`;
+        if (res.skipped && res.skipped.length)
+          msg += ` ${res.skipped.length} skipped — output already exists (tick "Overwrite Existing" to replace).`;
+        if (res.errors && res.errors.length)
+          msg += ` ${res.errors.length} failed — see the terminal running review_gui.py.`;
+      }
+      alert(msg);
+      loadUpscale();
+      return;
+    }
+    await new Promise(res => setTimeout(res, 500));
+  }
+}
+
+async function stopUpscale() {
+  const btn = document.getElementById('upscale-stop');
+  if (btn) { btn.disabled = true; btn.textContent = 'Stopping…'; }
+  try { await fetch('/api/upscale/stop', {method: 'POST'}); } catch (e) { /* poll loop will still end */ }
 }
 
 // ---------- Jobs tab (Pending Jobs) ----------
@@ -3004,9 +3155,28 @@ function spawnKoboldWords() {
   // even though the server-side root/scan didn't change, so this needs to
   // (re)kick off all three tabs' loads same as a fresh "Use this directory".
   const s = await refreshRootLabel();
+  // An upscale run started before this reload is still going server-side -
+  // re-enter running mode and re-attach to it rather than showing a stale
+  // config pane over a locked backend.
+  let upscaleInFlight = false;
+  try {
+    const p = await (await fetch('/api/progress')).json();
+    upscaleInFlight = p.active && p.kind === 'upscale';
+  } catch (e) { /* ignore */ }
+  if (upscaleInFlight) {
+    document.querySelectorAll('#subtabs button').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.subpanel').forEach(p => p.style.display = 'none');
+    document.querySelector('#subtabs button[data-subtab="upscale"]').classList.add('active');
+    activeSubtab = 'upscale';
+    document.getElementById('sub-upscale').style.display = 'block';
+    enterUpscaleRunning();
+    pollUpscale();
+  }
   if (s.root) startAllTabLoads();
-  await reloadActive();
-  if (!currentRoot) openPicker();
+  if (!upscaleInFlight) {
+    await reloadActive();
+    if (!currentRoot) openPicker();
+  }
 })();
 </script>
 </body></html>
@@ -3473,16 +3643,25 @@ def make_handler(state: State):
                     # Start) - the tree can change between when the list was
                     # last shown and when Start is actually clicked.
                     def cb(rel, i, total):
-                        prog.phase_tick(0, f"Upscaling: {rel}", i, total)
+                        prog.phase_tick(0, rel, i, total)
                     return upscale.run_upscale(root, excludes, target, out_dir=out_dir,
-                                               affix=affix, affix_pos=affix_pos,
-                                               overwrite=overwrite, on_progress=cb)
+                                               affix=affix, affix_pos=affix_pos, overwrite=overwrite,
+                                               cancel=prog.cancel_requested, on_progress=cb,
+                                               on_done=prog.add_detail)
 
                 started = start_job("upscale", 1, work)
                 if not started:
                     self._json({"ok": False, "error": "a job is already running"}, status=409)
                     return
                 self._json({"ok": True, "started": True})
+                return
+
+            if path == "/api/upscale/stop":
+                # Cancels an in-flight upscale run - run_upscale polls this
+                # between files and terminates the child realesrgan process.
+                if progress.active and progress.kind == "upscale":
+                    progress.request_cancel()
+                self._json({"ok": True})
                 return
 
             if path == "/api/upscale/install":
