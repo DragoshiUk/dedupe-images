@@ -28,11 +28,11 @@ safety rule, not two.
 Upscale sits outside that quarantine/restore system entirely: it's
 additive, not destructive — it only ever writes a new file for an original
 that's under the target resolution (by default `<name>_upscaled.<ext>`
-next to the source; optionally a chosen prefix/suffix and/or a separate
+next to the source; optionally a suffix you choose and/or a separate
 output directory anywhere on the filesystem), never moves or deletes
 anything, so it has no manifest entry and nothing to restore. It has its
-own direct Start button on its own tab instead of going through Pending
-Jobs.
+own **Upscale** button on its own tab instead of going through Pending
+Jobs, and while it runs the rest of the app is locked.
 
 Two deliberate, separately-warned exceptions to "nothing is ever
 deleted": Pending Jobs' **"skip quarantine"** checkbox permanently
@@ -125,15 +125,15 @@ later, from Pending Jobs. **Rescan** re-walks the directory from scratch
 restoring prior decisions for any group it rediscovers unchanged.
 
 **Operations → Upscale** — AI-upscales images (Real-ESRGAN on the GPU) so
-their longest side reaches a target resolution you set with a slider (up
-to 8192px/8K), preserving aspect ratio; an image already at or above the
-target isn't touched or listed. The eligible list updates live as you
+their longest side reaches a **Resolution Target** you set with a slider
+(up to 8192px/8K), preserving aspect ratio; an image already at or above
+the target isn't touched or listed. The eligible list updates live as you
 drag the slider. A warning appears once a lot of images are queued, since
 GPU upscaling processes one image at a time and can take a while per
 image. Each result is a new file — originals are never modified or
 removed — so unlike the other three operations this has no
-quarantine/manifest/restore involvement at all, and runs immediately from
-its own Upscale button rather than through Pending Jobs. Options:
+quarantine/manifest/restore involvement at all, and runs from its own
+**Upscale** button rather than through Pending Jobs. Options:
 
 - **Output Directory** — alongside each original (default), or a directory
   you pick anywhere on the filesystem via **Change** (the picker has a
@@ -149,22 +149,24 @@ its own Upscale button rather than through Pending Jobs. Options:
   silently replaced (and in "alongside" mode a file that already ends with
   the append text isn't re-processed). Tick it to replace instead.
 
-While a run is going the rest of the app is locked (the tabs and directory
-switcher are disabled, the sub-tab shows a spinner) and the Upscale pane
-becomes a live list of finished/skipped/failed outputs. Progress shows in
-the bottom status bar, not a modal. **Stop Upscaling** — in the same spot
-the Upscale button was — cancels the run, killing the in-flight GPU
-process; whatever finished before that is kept.
+While a run is going the rest of the app is locked (tabs and the directory
+switcher disabled, a spinner on the sub-tab) and the Upscale pane becomes
+a live list of finished/skipped/failed outputs; progress shows in the
+bottom status bar, not a modal. **Stop Upscaling** — in the same spot the
+Upscale button was — cancels the run, killing the in-flight GPU process;
+whatever finished before that is kept.
 
-Needs `realesrgan-ncnn-vulkan`. If it's missing, the command line says so
-at startup and the Upscale tab shows a **Download** button that fetches
-the self-contained portable build (binary + models, ~45 MB) into
-`~/.local/share/dedupe-images/` — no sudo, nothing system-wide — with a
-live progress bar and log; every other tab works without it. Or install
-the `realesrgan-ncnn-vulkan` AUR package. The actual resize/upscale logic
-lives in `upscale.py` — unlike `dedupe_images.py`, `find_near_duplicates.py`,
-and `apply_review.py`, it's a library module for `review_gui.py` only, not
-a standalone command-line tool.
+Needs `realesrgan-ncnn-vulkan` and a Vulkan-capable GPU with enough VRAM
+for the target size (it retries at smaller GPU tiles if it runs short). If
+the tool is missing, the command line says so at startup and the Upscale
+tab shows a **Download** button that fetches the self-contained portable
+build (binary + models, ~45 MB) into `~/.local/share/dedupe-images/` — no
+sudo, nothing system-wide — with a live progress bar and log; every other
+tab works without it. Or install the `realesrgan-ncnn-vulkan` AUR package.
+The actual resize/upscale logic lives in `upscale.py` — unlike
+`dedupe_images.py`, `find_near_duplicates.py`, and `apply_review.py`, it's
+a library module for `review_gui.py` only, not a standalone command-line
+tool.
 
 **Operations → Normalisation** — directory-merge (`Foo`+`Foo_1` sibling
 folders) and lowercase-renaming, combined into one read-only preview.
