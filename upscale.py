@@ -4,13 +4,15 @@ AI upscale support for review_gui.py's Upscale tab.
 Resizes an image so its longest side hits a target pixel count, preserving
 aspect ratio, driven from the web UI.
 
-- Already >= target: single Lanczos3 downsample (PIL) - AI upscaling
-  never helps when shrinking.
-- Smaller than target: runs Real-ESRGAN (realesrgan-ncnn-vulkan, GPU) at
-  the smallest integer factor (2/3/4x) that covers the gap, chaining a
-  second 4x pass only for extreme scale-ups (>~6x), then one final
-  Lanczos3 resample to the *exact* target pixel count. Each GPU pass is
-  retried at smaller tile sizes if it runs out of VRAM (see TILE_LADDER).
+- Within AI_MIN_FACTOR of the target (or already >= it): a single Lanczos3
+  resize - AI upscaling isn't worth its cost that close, and never helps
+  when shrinking.
+- Meaningfully smaller: runs Real-ESRGAN (realesrgan-ncnn-vulkan, GPU) at
+  its native 4x (the -s flag is not native to the x4plus model and
+  corrupts tile stitching), chaining a second 4x pass only for extreme
+  scale-ups (>~6x), then one final Lanczos3 resample to the *exact* target
+  pixel count. Each GPU pass is retried at smaller tile sizes if it runs
+  out of VRAM (see TILE_LADDER).
 
 Output is a new file - by default "<name>_upscaled.<ext>" next to the
 original, or, when an output directory is chosen, the source tree
@@ -221,14 +223,11 @@ def output_path(src: Path, root: Path, out_dir: Path | None,
     return out_dir / src.relative_to(root).parent / name
 
 
-def pick_scale(needed: float) -> int:
-    """Real-ESRGAN only supports integer scales 2/3/4 - the smallest one
-    that reaches or exceeds the requested factor."""
-    if needed <= 2:
-        return 2
-    if needed <= 3:
-        return 3
-    return 4
+# Below this upscale factor, skip Real-ESRGAN entirely: a plain Lanczos
+# resize is faster, far lighter on memory, and visually fine, and a full
+# 4x AI pass on an already-large source produces a needlessly huge
+# intermediate that most of gets thrown away in the downscale.
+AI_MIN_FACTOR = 1.5
 
 
 def _run_one_pass(infile: Path, outfile: Path, scale: int, tile: int,
@@ -308,14 +307,14 @@ def upscale_one(path: Path, target: int, root: Path, out_dir: Path | None = None
     if dest.exists() and not overwrite:
         raise OutputExists(dest)
 
-    # realesrgan-ncnn-vulkan writes the format its -o extension names; PNG
-    # is the safe universal for the intermediates regardless of source type.
     with Image.open(path) as img:
         w, h = img.size
         longest = max(w, h)
-        if longest >= target:
+        if target / longest < AI_MIN_FACTOR:
+            # already at/above target, or so close that AI upscaling isn't
+            # worth its cost - just Lanczos to the exact size.
             dest.parent.mkdir(parents=True, exist_ok=True)
-            _lanczos_resize(img, w, h, target / longest, dest)  # downscale, no AI
+            _lanczos_resize(img, w, h, target / longest, dest)
             return dest
 
     if tool is None:
@@ -324,15 +323,13 @@ def upscale_one(path: Path, target: int, root: Path, out_dir: Path | None = None
         raise RuntimeError(f"realesrgan-ncnn-vulkan is not installed - install {INSTALL_HINT}")
     binary, models_dir = tool
 
-    scale = pick_scale(target / longest)
-    total_scale = scale
-
-    # Chain a second 4x AI pass only when one pass leaves the image so far
-    # below target that finishing with Lanczos would visibly soften it -
-    # i.e. still more than ~1.5x short. A small shortfall (a ~1000px source
-    # for a 4096 target lands at 4000px after 4x) is finished with a barely
-    # perceptible Lanczos nudge instead of a second 4x pass, which would
-    # otherwise blow the intermediate up to 16000px / ~200 megapixels.
+    # realesrgan-x4plus-anime is a 4x-only model. Forcing -s 2 or -s 3 on
+    # it corrupts realesrgan-ncnn-vulkan's tile stitching (a visible
+    # checkerboard / missing chunks), so always run it at 4x and let the
+    # final Lanczos resample hit the exact target. A second 4x pass is
+    # chained only for extreme scale-ups (>6x); anything short of that is
+    # finished with a small, barely-perceptible Lanczos step.
+    total_scale = 4
     while longest * total_scale * 1.5 < target and total_scale < 16:
         total_scale *= 4
 
@@ -347,9 +344,9 @@ def upscale_one(path: Path, target: int, root: Path, out_dir: Path | None = None
         except OSError:
             shutil.copy2(path, staged)
         pass1 = tmp / "pass1.png"
-        _run_realesrgan(staged, pass1, scale, binary, models_dir, cancel=cancel)
+        _run_realesrgan(staged, pass1, 4, binary, models_dir, cancel=cancel)
         source_for_resample = pass1
-        if total_scale != scale:
+        if total_scale != 4:
             pass2 = tmp / "pass2.png"
             _run_realesrgan(pass1, pass2, 4, binary, models_dir, cancel=cancel)
             source_for_resample = pass2
