@@ -2798,22 +2798,33 @@ function wireJobsControls(data) {
 function onStart() {
   const data = lastBuiltReview;
   if (!data) return;
-  const actionable = data.items.filter(it => it.action !== 'conflict');
+  // Count by what each action actually does. Only "delete" removes a file
+  // for good; "quarantine"/"move"/"rename" are all recorded in the
+  // manifest and reversible with --restore. "conflict" does nothing.
+  const c = data.counts || {};
+  const deleteN = c.delete || 0;
+  const reversibleN = (c.quarantine || 0) + (c.move || 0) + (c.rename || 0);
+  const opsLine = `<p>${plural(data.ops.length, 'operation')} will run: ${data.ops.map(o => OP_LABELS[o]).join(', ')}.</p>`;
+  const recomputeNote = `<p><b>Note:</b> Identical Files / Normalisation plans are recomputed fresh at the moment this runs (not replayed from this summary), ` +
+    `in case the folder changed since it was built - Visually Similar decisions are always applied exactly as you decided them.</p>`;
   let body;
   let confirmLabel = 'Start';
   let requireCheckbox = null;
-  if (data.delete_duplicates) {
-    body = `<div class="warn-box"><b>${plural(actionable.length, 'file')} will be PERMANENTLY DELETED</b>, not quarantined. ` +
-      `This cannot be undone - there is no way to get these files back afterward.</div>` +
-      `<p>${plural(data.ops.length, 'operation')} will run: ${data.ops.map(o => OP_LABELS[o]).join(', ')}.</p>` +
+  if (deleteN > 0) {
+    // skip-quarantine is on AND this plan has duplicates to delete outright
+    const also = reversibleN > 0
+      ? ` A further ${plural(reversibleN, 'file')} will be moved or renamed - those are recorded in the manifest and reversible.`
+      : '';
+    body = `<div class="warn-box"><b>${plural(deleteN, 'file')} will be PERMANENTLY DELETED</b>, not quarantined. ` +
+      `This cannot be undone - there is no way to get ${deleteN === 1 ? 'it' : 'them'} back afterward.${also}</div>` +
+      opsLine +
       `<label style="display:flex;gap:8px;align-items:center;margin-top:10px"><input type="checkbox" id="start-confirm-check"> I understand this permanently deletes files with no way to undo it.</label>`;
     confirmLabel = 'Delete permanently';
     requireCheckbox = 'start-confirm-check';
   } else {
-    body = `<p>${plural(actionable.length, 'file')} across ${plural(data.ops.length, 'operation')} will be moved into <code>_duplicates_quarantine/</code> or renamed. ` +
-      `Nothing is deleted - reversible with <code>dedupe_images.py --restore</code> until you delete the quarantine folder.</p>` +
-      `<p><b>Note:</b> Identical Files / Normalisation plans are recomputed fresh at the moment this runs (not replayed from this summary), ` +
-      `in case the folder changed since it was built - Visually Similar decisions are always applied exactly as you decided them.</p>`;
+    body = `<p>${plural(reversibleN, 'file')} across ${plural(data.ops.length, 'operation')} will be moved to <code>_duplicates_quarantine/</code>, merged into a keeper folder, or renamed. ` +
+      `Nothing is deleted - all of it is reversible with <code>dedupe_images.py --restore</code> until you delete the quarantine folder.</p>` +
+      recomputeNote;
   }
   confirmAction('Start pending jobs', body, async () => {
     const result = await runJob('Running operations', '/api/review/run',
