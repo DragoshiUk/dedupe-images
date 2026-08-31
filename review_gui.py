@@ -19,12 +19,14 @@ file with a per-file or restore-all option, plus a permanent-delete
 option once you're happy).
 
 Upscale doesn't go through Pending Jobs/Quarantine at all - it never
-moves or deletes anything, it just writes a new "<name>_upscaled" file
-alongside any image whose longest side is under the slider's target
-resolution (up to 8192px/8K), so there's no manifest/restore story for
-it and it has its own direct Start button. Requires
-realesrgan-ncnn-vulkan on PATH; the tab explains clearly if it's missing
-rather than failing partway through a run.
+moves or deletes anything, it just writes a new file for any image whose
+longest side is under the slider's target resolution (up to 8192px/8K):
+beside the original by default, or into a chosen output directory (source
+sub-folders recreated), with a configurable prefix/suffix on the name.
+So there's no manifest/restore story for it and it has its own direct
+Start button. Needs realesrgan-ncnn-vulkan; if it's missing the command
+line says so at startup and the Upscale tab offers a one-click download
+of the portable build.
 
 Nothing is deleted by a dedupe/merge/rename action itself - everything
 that would be removed is moved into _duplicates_quarantine/ with an entry
@@ -125,12 +127,16 @@ def run_with_manifest(root: Path, fn):
 
 
 def enrich_actions(root: Path, actions: list[dict]) -> list[dict]:
-    """Adds a "size" (bytes) field to each action dict, best-effort."""
+    """Adds "size" (bytes) and "is_dir" fields to each action dict,
+    best-effort. Only ever runs on preview (non-executed) plans, so the
+    source path is still there to stat."""
     for a in actions:
+        src = root / a["src"]
         try:
-            a["size"] = (root / a["src"]).stat().st_size
+            a["size"] = src.stat().st_size
         except OSError:
             a["size"] = 0
+        a["is_dir"] = src.is_dir()
     return actions
 
 
@@ -161,6 +167,7 @@ class Progress:
         self.total = 1
         self.error = None
         self.done_result = None
+        self.log = []  # bounded human-readable lines, for jobs that stream output
 
     def begin(self, kind: str, phase_count: int):
         with self.lock:
@@ -173,6 +180,13 @@ class Progress:
             self.total = 1
             self.error = None
             self.done_result = None
+            self.log = []
+
+    def log_line(self, text: str):
+        """Append a line to the job's rolling output log (last 200 kept)."""
+        with self.lock:
+            self.log.append(text)
+            del self.log[:-200]
 
     def phase_tick(self, index: int, name: str, current: int, total: int = 1):
         with self.lock:
@@ -199,7 +213,7 @@ class Progress:
                 "phase_index": self.phase_index, "phase_count": self.phase_count,
                 "current": self.current, "total": self.total, "pct": max(0, min(pct, 100)),
                 "error": self.error, "done": (not self.active) and (self.done_result is not None or self.error is not None),
-                "result": self.done_result,
+                "result": self.done_result, "log": list(self.log),
             }
 
 
@@ -442,28 +456,30 @@ def build_identical_items(root: Path, prefer: str, delete_duplicates: bool) -> l
     return items
 
 
+def _normalise_items(actions: list[dict]) -> list[dict]:
+    """Maps enriched dir-merge / name-normalize actions to the wire shape
+    the Jobs summary expects. Shared by both Normalisation sub-passes."""
+    return [{"op": "normalise", "action": a["type"], "path": a["src"],
+             "dest": a["dest"], "kept": a["kept"], "size": a["size"],
+             "is_dir": a["is_dir"], "was_conflict": a.get("was_conflict", False)} for a in actions]
+
+
 def build_dirmerge_items(root: Path, rename_conflicts: bool, delete_duplicates: bool) -> list[dict]:
     quarantine_dir = root / QUARANTINE_DIRNAME
     actions = plan_and_maybe_execute_dir_merge(root, quarantine_dir, False, [],
                                                 delete_duplicates=delete_duplicates,
                                                 rename_conflicts=rename_conflicts)
-    enrich_actions(root, actions)
-    return [{"op": "normalise", "action": a["type"], "path": a["src"],
-             "dest": a["dest"], "kept": a["kept"], "size": a["size"],
-             "is_dir": a.get("is_dir", False), "was_conflict": a.get("was_conflict", False)} for a in actions]
+    return _normalise_items(enrich_actions(root, actions))
 
 
-def build_lowercase_items(root: Path, rename_conflicts: bool, delete_duplicates: bool,
+def build_namestyle_items(root: Path, rename_conflicts: bool, delete_duplicates: bool,
                            case_style: str, sep_style: str) -> list[dict]:
     quarantine_dir = root / QUARANTINE_DIRNAME
     stats = plan_and_maybe_execute_normalize(root, quarantine_dir, False, [],
                                               delete_duplicates=delete_duplicates,
                                               rename_conflicts=rename_conflicts,
                                               case_style=case_style, sep_style=sep_style)
-    actions = enrich_actions(root, stats["actions"])
-    return [{"op": "normalise", "action": a["type"], "path": a["src"],
-             "dest": a["dest"], "kept": a["kept"], "size": a["size"],
-             "is_dir": a.get("is_dir", False), "was_conflict": a.get("was_conflict", False)} for a in actions]
+    return _normalise_items(enrich_actions(root, stats["actions"]))
 
 
 def build_visual_items(root: Path, decisions: dict, delete_duplicates: bool) -> list[dict]:
@@ -496,9 +512,9 @@ def do_build_review(root: Path, ops: list[str], prefer: str, rename_conflicts: b
             items.extend(build_dirmerge_items(root, rename_conflicts, delete_duplicates))
             prog.phase_tick(idx, "Normalisation: directory merge", 1, 1)
             idx += 1
-            prog.phase_tick(idx, "Normalisation: lowercase names", 0, 1)
-            items.extend(build_lowercase_items(root, rename_conflicts, delete_duplicates, case_style, sep_style))
-            prog.phase_tick(idx, "Normalisation: lowercase names", 1, 1)
+            prog.phase_tick(idx, "Normalisation: name styles", 0, 1)
+            items.extend(build_namestyle_items(root, rename_conflicts, delete_duplicates, case_style, sep_style))
+            prog.phase_tick(idx, "Normalisation: name styles", 1, 1)
             idx += 1
         elif op == "visual":
             prog.phase_tick(idx, OP_NAMES[op], 0, 1)
@@ -544,12 +560,12 @@ def do_run(root: Path, ops: list[str], prefer: str, rename_conflicts: bool, dele
                                                                 rename_conflicts=rename_conflicts)
                 prog.phase_tick(idx, "Running: Normalisation (directory merge)", 1, 1)
                 idx += 1
-                prog.phase_tick(idx, "Running: Normalisation (lowercase names)", 0, 1)
+                prog.phase_tick(idx, "Running: Normalisation (name styles)", 0, 1)
                 lc_stats = plan_and_maybe_execute_normalize(root, quarantine_dir, True, manifest,
                                                              delete_duplicates=delete_duplicates,
                                                              rename_conflicts=rename_conflicts,
                                                              case_style=case_style, sep_style=sep_style)
-                prog.phase_tick(idx, "Running: Normalisation (lowercase names)", 1, 1)
+                prog.phase_tick(idx, "Running: Normalisation (name styles)", 1, 1)
                 idx += 1
                 dm_counts = {"move": 0, "quarantine": 0, "delete": 0, "rename": 0, "conflict": 0}
                 for a in dm_actions:
@@ -873,11 +889,18 @@ PAGE = r"""<!doctype html>
   .quarantine-status .big { font-size:24px; font-weight:800; margin-bottom:6px; }
 
   /* ---------- upscale ---------- */
-  .upscale-slider-row { display:flex; align-items:center; gap:14px; padding:16px 18px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); margin-bottom:16px; flex-wrap:wrap; }
+  .upscale-slider-row { display:flex; align-items:center; gap:14px; padding:16px 18px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); margin-bottom:12px; flex-wrap:wrap; }
   .upscale-slider-row label { font-weight:600; font-size:13.5px; white-space:nowrap; }
   .upscale-slider-row input[type=range] { flex:1; min-width:220px; accent-color:var(--accent); height:6px; cursor:pointer; }
   .upscale-target-value { color:var(--accent); font-weight:700; }
   .upscale-summary { color:var(--text-dim); font-size:13px; margin-bottom:14px; }
+  .upscale-opt-row { display:flex; align-items:center; gap:10px; padding:12px 18px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); margin-bottom:12px; flex-wrap:wrap; font-size:13px; }
+  .upscale-opt-row > label:first-child { font-weight:600; font-size:13.5px; white-space:nowrap; }
+  .upscale-opt-row input[type=text] { background:var(--bg); color:var(--text); border:1px solid var(--border-strong); border-radius:var(--radius-sm); padding:6px 9px; font-size:13px; }
+  .upscale-opt-row select { background:var(--surface); color:var(--text); border:1px solid var(--border-strong); border-radius:var(--radius-sm); padding:6px 9px; font-size:13px; }
+  .upscale-opt-row code { background:var(--bg); padding:2px 6px; border-radius:4px; font-size:12px; word-break:break-all; }
+  .upscale-opt-row .dim { color:var(--text-faint); font-size:12px; }
+  .job-log { text-align:left; margin:14px 0 0; max-height:190px; overflow-y:auto; background:var(--bg); border:1px solid var(--border); border-radius:var(--radius-sm); padding:10px 12px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px; line-height:1.5; color:var(--text-dim); white-space:pre-wrap; word-break:break-all; }
   .warn-box { background:var(--danger-bg); border:1px solid var(--danger-border); border-radius:var(--radius); padding:14px 16px; color:#f2b6b9; font-size:13px; margin-bottom:12px; }
   .warn-box b { color:#ffcdcf; }
   /* solid yellow outline, faded/low-opacity yellow fill - distinct from
@@ -941,6 +964,7 @@ PAGE = r"""<!doctype html>
 
 <div id="picker-overlay" class="overlay">
   <div class="modal">
+    <div class="modal-title" id="picker-title">Choose a directory</div>
     <div id="picker-path"></div>
     <div id="picker-list"></div>
     <div id="picker-error"></div>
@@ -969,6 +993,7 @@ PAGE = r"""<!doctype html>
       <div class="big-pct" id="progress-pct">0%</div>
       <div class="bar"><div class="bar-fill" id="progress-fill" style="width:0%"></div></div>
       <div id="progress-label" style="margin-top:10px"></div>
+      <pre id="progress-log" class="job-log" hidden></pre>
     </div>
   </div>
 </div>
@@ -1028,10 +1053,21 @@ function showProgressOverlay(title) {
   document.getElementById('progress-pct').textContent = '0%';
   document.getElementById('progress-fill').style.width = '0%';
   document.getElementById('progress-label').textContent = '';
+  const log = document.getElementById('progress-log');
+  log.textContent = '';
+  log.hidden = true;
   document.getElementById('progress-overlay').classList.add('open');
 }
 function hideProgressOverlay() {
   document.getElementById('progress-overlay').classList.remove('open');
+}
+
+// Big counts (> 100k) are treated as a byte total and shown in MB - the
+// only job that reports one is the realesrgan-ncnn-vulkan download.
+function progressLabelText(p) {
+  if (!p.phase) return '';
+  if (p.total > 100000) return `${p.phase} (${(p.current/1048576).toFixed(1)} / ${(p.total/1048576).toFixed(1)} MB)`;
+  return `${p.phase} (${p.current}/${p.total})`;
 }
 
 async function pollUntilDone() {
@@ -1040,8 +1076,14 @@ async function pollUntilDone() {
     const p = await r.json();
     document.getElementById('progress-pct').textContent = p.pct + '%';
     document.getElementById('progress-fill').style.width = p.pct + '%';
-    document.getElementById('progress-label').textContent =
-      p.phase ? `${p.phase} (${p.current}/${p.total})` : '';
+    document.getElementById('progress-label').textContent = progressLabelText(p);
+    const log = document.getElementById('progress-log');
+    if (p.log && p.log.length) {
+      const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+      log.textContent = p.log.join('\n');
+      log.hidden = false;
+      if (atBottom) log.scrollTop = log.scrollHeight;
+    }
     if (p.done) return p;
     await new Promise(res => setTimeout(res, 350));
   }
@@ -1062,7 +1104,11 @@ async function runJob(title, startUrl, startBody) {
   const final = await pollUntilDone();
   hideProgressOverlay();
   if (final.error) {
-    alert('Error: ' + final.error);
+    // include the tail of the streamed log so "what actually happened"
+    // survives the overlay closing (matters most for the dependency download)
+    let m = 'Error: ' + final.error;
+    if (final.log && final.log.length) m += '\n\n' + final.log.slice(-8).join('\n');
+    alert(m);
     return null;
   }
   return final.result;
@@ -1165,10 +1211,11 @@ function setTabLoading(key, loading, label, pct) {
   }
 }
 
-// Kicks off all three Operations tabs' loads in parallel - called
-// whenever the chosen directory changes (picker confirm, or boot with an
-// already-known root), so every sub-tab's spinner is live from the start
-// regardless of which one happens to be active.
+// Kicks off the Identical Files / Normalisation / Visually Similar loads
+// - called whenever the chosen directory changes (picker confirm, or boot
+// with an already-known root), so each of those sub-tabs' spinners is live
+// from the start regardless of which one happens to be active. (Upscale
+// loads lazily on first visit - see the note at the end.)
 async function startAllTabLoads() {
   identicalData = null;
   normaliseData = null;
@@ -1186,8 +1233,7 @@ async function startAllTabLoads() {
   // this very first paint - pollScan()'s first tick (and every one after)
   // then only ever updates that existing bar/text in place, never
   // recreating the spinner, which is what keeps its animation continuous.
-  setTabLoading('visual', true, 'Hashing images', 0);
-  setSmallSpinner('visual', true);  // stays lit through pollScan()'s whole run, not just this initial paint
+  setTabLoading('visual', true, 'Hashing images', 0);  // small spinner stays lit through pollScan()'s whole run
   pollScan();
   // Identical Files and Normalisation both hash their way through every
   // file (SHA-256) - real CPU-bound work that, under Python's GIL,
@@ -1200,7 +1246,9 @@ async function startAllTabLoads() {
   // particular contention.
   await loadIdentical();
   await loadNormalise();
-  await loadUpscale();
+  // Upscale is deliberately not pre-loaded here: its preview is a whole
+  // extra tree walk that opens every image for its dimensions, it feeds
+  // no badge, and reloadActive() lazy-loads it on first visit anyway.
 }
 
 let scanActive = false;   // read by renderVisual() to word its empty state
@@ -1385,20 +1433,29 @@ async function browseTo(path) {
   });
 }
 
-function openPicker() {
+// The picker overlay is shared: openPicker() with no args is the "choose
+// the scan root" flow (its old behaviour); pass {onChoose} to reuse the
+// same overlay to pick any other directory (e.g. the Upscale output dir),
+// with the callback getting the chosen absolute path.
+let pickerChoose = defaultRootChoose;
+let pickerCanCancel = true;
+
+function openPicker(opts) {
+  opts = opts || {};
+  pickerChoose = opts.onChoose || defaultRootChoose;
+  // the root flow can't be cancelled until there's a root to fall back on;
+  // any other use is always cancellable
+  pickerCanCancel = opts.onChoose ? true : !!currentRoot;
+  document.getElementById('picker-title').textContent = opts.title || 'Choose the image directory to scan';
+  document.getElementById('picker-use').textContent = opts.useLabel || 'Use this directory';
   document.getElementById('picker-overlay').classList.add('open');
-  browseTo(currentRoot || null);
+  browseTo(opts.startAt || currentRoot || null);
 }
 function closePicker() {
   document.getElementById('picker-overlay').classList.remove('open');
 }
 
-document.getElementById('change-dir').onclick = openPicker;
-document.getElementById('picker-cancel').onclick = () => { if (currentRoot) closePicker(); };
-document.getElementById('picker-use').onclick = async () => {
-  if (!browsePath) return;
-  const chosen = browsePath;
-  closePicker();
+async function defaultRootChoose(chosen) {
   const r = await fetch('/api/set-root', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({path: chosen})
@@ -1418,6 +1475,15 @@ document.getElementById('picker-use').onclick = async () => {
     await new Promise(res => setTimeout(res, 50));
   }
   await reloadActive();
+}
+
+document.getElementById('change-dir').onclick = () => openPicker();
+document.getElementById('picker-cancel').onclick = () => { if (pickerCanCancel) closePicker(); };
+document.getElementById('picker-use').onclick = async () => {
+  if (!browsePath) return;
+  const chosen = browsePath;
+  closePicker();
+  await pickerChoose(chosen);
 };
 
 // ---------- shared: confirmation modal ----------
@@ -1729,7 +1795,6 @@ function wireVisualRescan() {
     const result = await r.json();
     if (!result.ok) { alert(result.error || 'rescan failed'); return; }
     setTabLoading('visual', true, 'Hashing images', 0);
-    setSmallSpinner('visual', true);
     pollScan();
   };
 }
@@ -2365,25 +2430,43 @@ function wireNormaliseToolbar() {
 // ---------- Upscale sub-tab ----------
 //
 // Not part of the Pending Jobs staging system the other three Operations
-// tabs share - AI upscaling is additive (writes a new "<name>_upscaled"
-// file alongside the original, never moves/deletes anything), so there's
-// no quarantine/manifest/restore story here at all, and no "keep vs
-// discard" decision to stage. It gets its own self-contained Start
-// button instead, same shape as the Quarantine tab's buttons.
+// tabs share - AI upscaling is additive (writes a new file, never
+// moves/deletes anything), so there's no quarantine/manifest/restore
+// story here at all, and no "keep vs discard" decision to stage. It gets
+// its own self-contained Start button instead, same shape as the
+// Quarantine tab's buttons.
 
-let upscaleData = null;     // raw {images, min_target, max_target, default_target, tool_error} from the last scan
-let upscaleTarget = null;   // current slider value - null until the first load sets it from default_target
+let upscaleData = null;      // raw preview payload from the last scan
+let upscaleTarget = null;    // slider value - null until the first load pulls default_target
+let upscaleAffix = null;     // filename affix text - null until the first load pulls default_affix
+let upscaleAffixPos = 'suffix';  // 'suffix' (append) | 'prefix' (prepend)
+let upscaleOutDir = null;    // null = alongside each original; else an absolute directory
 let upscaleSliderDebounce = null;
 const UPSCALE_WARN_THRESHOLD = 15;  // eligible count at/above which the "this'll take a while" box shows
+
+// Matches the server-side guard: an empty affix only overwrites originals
+// when the copy also lands in the source location, so a separate output
+// directory makes an empty affix safe.
+function upscaleOutputOk() {
+  return !!(upscaleAffix || upscaleOutDir);
+}
+
+// "photo.jpg" -> what the affix + position would name it
+function upscaleExampleName() {
+  const a = upscaleAffix || '';
+  return (upscaleAffixPos === 'prefix' ? a + 'photo' : 'photo' + a) + '.jpg';
+}
 
 async function loadUpscale() {
   if (tabLoading.upscale) return;  // already in flight (e.g. from startAllTabLoads) - avoid an overlapping duplicate fetch
   setTabLoading('upscale', true, 'Scanning');
   try {
-    const r = await fetch('/api/upscale/preview');
+    const q = upscaleOutDir ? `?out_dir=${encodeURIComponent(upscaleOutDir)}` : '';
+    const r = await fetch('/api/upscale/preview' + q);
     const data = await r.json();
     upscaleData = data;
     if (upscaleTarget === null) upscaleTarget = data.default_target;
+    if (upscaleAffix === null) upscaleAffix = data.default_affix;
     setTabLoading('upscale', false);
     renderUpscale(data);
   } catch (e) {
@@ -2398,16 +2481,19 @@ function eligibleUpscaleImages(data, target) {
 }
 
 // Only the summary/warning/list portion - deliberately never touches the
-// slider or Start button elements themselves, so re-running this on every
-// slider "input" event (i.e. continuously while dragging) can't ever
-// interrupt an in-progress drag by replacing the <input type=range> out
-// from under the browser's own drag handling.
+// slider, options rows or Start button elements themselves, so re-running
+// this on every slider "input" event (i.e. continuously while dragging)
+// can't ever interrupt an in-progress drag by replacing the
+// <input type=range> out from under the browser's own drag handling.
 function updateUpscaleEligibleSection(data, target) {
   const section = document.getElementById('upscale-eligible-section');
   if (!section) return;
   const eligible = eligibleUpscaleImages(data, target);
   const startBtn = document.getElementById('upscale-start');
-  if (startBtn) startBtn.disabled = !!data.tool_error || eligible.length === 0;
+  if (startBtn) startBtn.disabled = !!data.tool_error || eligible.length === 0 || !upscaleOutputOk();
+  const hint = document.getElementById('upscale-start-hint');
+  if (hint) hint.textContent = (!data.tool_error && !upscaleOutputOk())
+    ? 'Set a filename prefix/suffix or a separate output directory first.' : '';
 
   let html = `<div class="upscale-summary">${plural(eligible.length, 'image')} below ${target}px on their longest side` +
     (eligible.length ? ' - eligible for upscaling.' : '.') +
@@ -2442,21 +2528,61 @@ function updateUpscaleEligibleSection(data, target) {
 function renderUpscale(data) {
   const panel = document.getElementById('sub-upscale');
   let html = `<h2 class="page-title">Upscale</h2>
-    <p class="page-sub">AI-upscales images (Real-ESRGAN, GPU) so their longest side reaches the target below, preserving aspect ratio. Images already at or above the target aren't touched or listed. Output is saved as a new "&lt;name&gt;_upscaled" file - originals are never modified or removed.</p>`;
+    <p class="page-sub">AI-upscales images (Real-ESRGAN, GPU) so their longest side reaches the target below, preserving aspect ratio. Images already at or above the target aren't touched or listed. Each result is written as a new file - originals are never modified or removed.</p>`;
+
+  // Dependency box - only shows here (the command line already noted it at
+  // startup), with a one-click download of the self-contained build.
   if (data.tool_error) {
-    html += `<div class="warn-box">Upscaling isn't available on this machine: ${esc(data.tool_error)}</div>`;
+    html += `<div class="warn-box warn-yellow" id="upscale-dep-box">
+      <b>realesrgan-ncnn-vulkan isn't installed.</b> It's the GPU tool that does the actual upscaling - every other tab works without it.
+      <div style="margin-top:10px">${esc(data.tool_error)}</div>
+      <div class="toolbar" style="margin:12px 0 0">
+        <button class="btn btn-primary" id="upscale-install">Download realesrgan-ncnn-vulkan</button>
+        <span class="dim">~45&nbsp;MB, self-contained, into <code>~/.local/share/dedupe-images/</code> - no sudo.</span>
+      </div>
+    </div>`;
   }
+
   html += `<div class="upscale-slider-row">
     <label for="upscale-target">Target longest side: <span class="upscale-target-value" id="upscale-target-value">${upscaleTarget}px</span></label>
     <input type="range" id="upscale-target" min="${data.min_target}" max="${data.max_target}" step="1" value="${upscaleTarget}">
     <button class="btn" id="upscale-rescan">Rescan</button>
+  </div>`;
+
+  const outLabel = upscaleOutDir
+    ? `<code>${esc(upscaleOutDir)}</code> <span class="dim">(source sub-folders recreated inside)</span>`
+    : 'Alongside each original image';
+  html += `<div class="upscale-opt-row">
+    <label>Save to:</label>
+    <span id="upscale-outdir-label">${outLabel}</span>
+    <button class="btn btn-sm" id="upscale-outdir-pick">Choose directory&hellip;</button>
+    ${upscaleOutDir ? '<button class="btn btn-sm" id="upscale-outdir-reset">Reset to default</button>' : ''}
   </div>
-  <div id="upscale-eligible-section"></div>
+  <div class="upscale-opt-row">
+    <label id="upscale-affix-label" for="upscale-affix">Filename ${upscaleAffixPos === 'prefix' ? 'prefix' : 'suffix'}:</label>
+    <input type="text" id="upscale-affix" value="${esc(upscaleAffix)}" spellcheck="false" style="width:150px">
+    <select id="upscale-affix-pos">
+      <option value="suffix"${upscaleAffixPos === 'suffix' ? ' selected' : ''}>Append (after name)</option>
+      <option value="prefix"${upscaleAffixPos === 'prefix' ? ' selected' : ''}>Prepend (before name)</option>
+    </select>
+    <span class="dim">e.g. <code id="upscale-affix-example">photo.jpg &rarr; ${esc(upscaleExampleName())}</code></span>
+  </div>`;
+
+  html += `<div id="upscale-eligible-section"></div>
   <div class="toolbar">
     <button class="btn btn-primary btn-lg" id="upscale-start" ${data.tool_error ? 'disabled' : ''}>Start Upscale</button>
+    <span class="spacer-note" id="upscale-start-hint"></span>
   </div>`;
   panel.innerHTML = html;
   updateUpscaleEligibleSection(data, upscaleTarget);
+
+  const installBtn = document.getElementById('upscale-install');
+  if (installBtn) installBtn.onclick = async () => {
+    const result = await runJob('Downloading realesrgan-ncnn-vulkan&hellip;', '/api/upscale/install', {});
+    if (result === null) return;  // runJob already alerted
+    alert('realesrgan-ncnn-vulkan installed. See the log for any warnings (e.g. a missing Vulkan driver).');
+    loadUpscale();
+  };
 
   document.getElementById('upscale-rescan').onclick = loadUpscale;
   document.getElementById('upscale-target').oninput = (e) => {
@@ -2465,12 +2591,41 @@ function renderUpscale(data) {
     clearTimeout(upscaleSliderDebounce);
     upscaleSliderDebounce = setTimeout(() => updateUpscaleEligibleSection(upscaleData, upscaleTarget), 80);
   };
+
+  document.getElementById('upscale-outdir-pick').onclick = () => openPicker({
+    title: 'Choose a directory for the upscaled images',
+    useLabel: 'Save upscaled images here',
+    startAt: upscaleOutDir || currentRoot || null,
+    onChoose: (path) => { upscaleOutDir = path; loadUpscale(); },
+  });
+  const resetBtn = document.getElementById('upscale-outdir-reset');
+  if (resetBtn) resetBtn.onclick = () => { upscaleOutDir = null; loadUpscale(); };
+
+  const affixInput = document.getElementById('upscale-affix');
+  const affixPos = document.getElementById('upscale-affix-pos');
+  function syncAffix() {
+    upscaleAffix = affixInput.value;
+    upscaleAffixPos = affixPos.value;
+    document.getElementById('upscale-affix-label').textContent =
+      'Filename ' + (upscaleAffixPos === 'prefix' ? 'prefix' : 'suffix') + ':';
+    document.getElementById('upscale-affix-example').innerHTML =
+      'photo.jpg &rarr; ' + esc(upscaleExampleName());
+    updateUpscaleEligibleSection(upscaleData, upscaleTarget);  // Start disabled/hint depend on the affix
+  }
+  affixInput.oninput = syncAffix;
+  affixPos.onchange = syncAffix;
+
   document.getElementById('upscale-start').onclick = async () => {
     const eligible = eligibleUpscaleImages(upscaleData, upscaleTarget);
+    const where = upscaleOutDir
+      ? `into <code>${esc(upscaleOutDir)}</code> (source sub-folders recreated)`
+      : 'next to each original';
     confirmAction('Start upscaling',
-      `<p>${plural(eligible.length, 'image')} below ${upscaleTarget}px will be upscaled to that size on their longest side. This runs on the GPU and can take a while - the page will show progress as it goes.</p>`,
+      `<p>${plural(eligible.length, 'image')} below ${upscaleTarget}px will be upscaled to that size on their longest side, saved ${where} with <code>${esc(upscaleExampleName())}</code>-style names. Originals are never touched.</p>
+       <p>This runs on the GPU and can take a while - the page shows progress as it goes.</p>`,
       async () => {
-        const result = await runJob('Upscaling images&hellip;', '/api/upscale/run', {target: upscaleTarget});
+        const result = await runJob('Upscaling images&hellip;', '/api/upscale/run',
+          {target: upscaleTarget, out_dir: upscaleOutDir || '', affix: upscaleAffix, affix_pos: upscaleAffixPos});
         if (result === null) return;
         let msg = `Upscaled ${plural(result.processed, 'image')}.`;
         if (result.errors.length) msg += ` ${plural(result.errors.length, 'image')} failed - see the server console for details.`;
@@ -2837,6 +2992,14 @@ def make_handler(state: State):
                 return None
             return root
 
+        def _valid_styles(self, case_style, sep_style):
+            """True if both normalisation style params are recognised;
+            otherwise emits a 400 and returns False so the caller returns."""
+            if case_style not in CASE_STYLES or sep_style not in SEPARATOR_STYLES:
+                self._json({"ok": False, "error": "invalid case_style/sep_style"}, status=400)
+                return False
+            return True
+
         def do_GET(self):
             parsed = urlparse(self.path)
 
@@ -2922,8 +3085,7 @@ def make_handler(state: State):
                 rename_conflicts = qs.get("rename_conflicts", ["false"])[0] == "true"
                 case_style = qs.get("case_style", ["lower"])[0]
                 sep_style = qs.get("sep_style", ["none"])[0]
-                if case_style not in CASE_STYLES or sep_style not in SEPARATOR_STYLES:
-                    self._json({"ok": False, "error": "invalid case_style/sep_style"}, status=400)
+                if not self._valid_styles(case_style, sep_style):
                     return
                 self._json(_normalise_preview_json(root, rename_conflicts, case_style, sep_style))
                 return
@@ -2935,10 +3097,19 @@ def make_handler(state: State):
                 # Unfiltered by target size - the web UI filters/re-renders
                 # client-side as the resolution slider moves, rather than
                 # re-scanning the whole tree on every tick.
-                quarantine_dir = root / QUARANTINE_DIRNAME
-                review_dir = root / REVIEW_DIRNAME
+                qs = parse_qs(parsed.query)
+                excludes = {root / QUARANTINE_DIRNAME, root / REVIEW_DIRNAME}
+                # out_dir is only used here to keep a previous run's own
+                # output from showing up as fresh candidates; a path that
+                # doesn't exist yet simply excludes nothing.
+                out_raw = (qs.get("out_dir", [""])[0] or "").strip()
+                if out_raw:
+                    try:
+                        excludes.add(Path(out_raw).expanduser().resolve())
+                    except OSError:
+                        pass
                 images = []
-                for p, w, h in upscale.iter_upscale_candidates(root, quarantine_dir, review_dir):
+                for p, w, h in upscale.iter_upscale_candidates(root, excludes):
                     size = p.stat().st_size
                     images.append({
                         "path": str(p.relative_to(root)), "width": w, "height": h,
@@ -2946,7 +3117,8 @@ def make_handler(state: State):
                     })
                 self._json({
                     "images": images, "min_target": upscale.MIN_TARGET, "max_target": upscale.MAX_TARGET,
-                    "default_target": upscale.DEFAULT_TARGET, "tool_error": upscale.tool_status(),
+                    "default_target": upscale.DEFAULT_TARGET, "default_affix": upscale.DEFAULT_AFFIX,
+                    "tool_error": upscale.tool_status(),
                 })
                 return
 
@@ -3106,8 +3278,7 @@ def make_handler(state: State):
                 if not ops:
                     self._json({"ok": False, "error": "no operations selected"}, status=400)
                     return
-                if case_style not in CASE_STYLES or sep_style not in SEPARATOR_STYLES:
-                    self._json({"ok": False, "error": "invalid case_style/sep_style"}, status=400)
+                if not self._valid_styles(case_style, sep_style):
                     return
                 phase_count = sum(2 if o == "normalise" else 1 for o in ops) or 1
                 started = start_job("build", phase_count,
@@ -3133,8 +3304,7 @@ def make_handler(state: State):
                 if not ops:
                     self._json({"ok": False, "error": "no operations selected"}, status=400)
                     return
-                if case_style not in CASE_STYLES or sep_style not in SEPARATOR_STYLES:
-                    self._json({"ok": False, "error": "invalid case_style/sep_style"}, status=400)
+                if not self._valid_styles(case_style, sep_style):
                     return
                 phase_count = sum(2 if o == "normalise" else 1 for o in ops) + 1
                 started = start_job("run", phase_count,
@@ -3164,18 +3334,66 @@ def make_handler(state: State):
                     self._json({"ok": False, "error": f"target must be between {upscale.MIN_TARGET} and {upscale.MAX_TARGET}"}, status=400)
                     return
 
+                affix = str(body.get("affix", upscale.DEFAULT_AFFIX))
+                affix_pos = str(body.get("affix_pos", "suffix"))
+                if affix_pos not in upscale.AFFIX_POSITIONS:
+                    self._json({"ok": False, "error": "affix_pos must be 'prefix' or 'suffix'"}, status=400)
+                    return
+                if "/" in affix or "\\" in affix or "\x00" in affix:
+                    self._json({"ok": False, "error": "filename affix can't contain a path separator"}, status=400)
+                    return
+
+                out_raw = (body.get("out_dir") or "").strip()
+                out_dir = None
+                if out_raw:
+                    try:
+                        out_dir = Path(out_raw).expanduser().resolve()
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                    except OSError as e:
+                        self._json({"ok": False, "error": f"can't use that output directory: {e}"}, status=400)
+                        return
+                # Guard against writing over the originals: only possible
+                # when output lands in the source location AND the affix is
+                # empty, so nothing distinguishes the copy from its source.
+                if not affix and (out_dir is None or out_dir == root):
+                    self._json({"ok": False, "error": "set a filename prefix/suffix, or a separate output directory, so upscaled files don't overwrite the originals"}, status=400)
+                    return
+
                 def work(prog):
-                    quarantine_dir = root / QUARANTINE_DIRNAME
-                    review_dir = root / REVIEW_DIRNAME
+                    excludes = {root / QUARANTINE_DIRNAME, root / REVIEW_DIRNAME}
                     # Fresh recompute of the eligible list at execute time
                     # (same reasoning as Identical Files/Normalisation's
                     # Start) - the tree can change between when the list was
                     # last shown and when Start is actually clicked.
                     def cb(rel, i, total):
                         prog.phase_tick(0, f"Upscaling: {rel}", i, total)
-                    return upscale.run_upscale(root, quarantine_dir, review_dir, target, on_progress=cb)
+                    return upscale.run_upscale(root, excludes, target, out_dir=out_dir,
+                                               affix=affix, affix_pos=affix_pos, on_progress=cb)
 
                 started = start_job("upscale", 1, work)
+                if not started:
+                    self._json({"ok": False, "error": "a job is already running"}, status=409)
+                    return
+                self._json({"ok": True, "started": True})
+                return
+
+            if path == "/api/upscale/install":
+                # Downloads the portable realesrgan-ncnn-vulkan build into a
+                # user-local dir (no sudo, nothing system-wide). Progress and
+                # the live log stream through the shared job tracker, same as
+                # any other job - the Upscale tab shows both.
+                if upscale.resolve_tool() is not None:
+                    self._json({"ok": False, "error": "realesrgan-ncnn-vulkan is already installed"}, status=400)
+                    return
+
+                def work(prog):
+                    def on_bytes(done, total):
+                        prog.phase_tick(0, "Downloading realesrgan-ncnn-vulkan", done, total or 1)
+                    prog.log_line("Starting realesrgan-ncnn-vulkan download")
+                    upscale.install_tool(on_log=prog.log_line, on_bytes=on_bytes)
+                    return {"installed": True}
+
+                started = start_job("upscale-install", 1, work)
                 if not started:
                     self._json({"ok": False, "error": "a job is already running"}, status=409)
                     return
@@ -3245,9 +3463,15 @@ def main():
     state = State(args.threshold, extensions)
 
     handler = make_handler(state)
-    server = QuietHTTPServer(("0.0.0.0", args.port), handler)
+    server = QuietHTTPServer(("127.0.0.1", args.port), handler)
     url = f"http://127.0.0.1:{args.port}/"
     print(f"Serving at {url} (Ctrl-C to stop)")
+
+    upscale_missing = upscale.tool_status()
+    if upscale_missing:
+        print(f"Note: {upscale_missing}")
+        print("      Every tab except Upscale works without it; the Upscale tab "
+              "has a one-click Download button.")
 
     if args.root is not None:
         root = Path(args.root).resolve()
