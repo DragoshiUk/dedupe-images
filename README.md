@@ -136,8 +136,9 @@ quarantine/manifest/restore involvement at all, and runs immediately from
 its own Start button rather than through Pending Jobs. Two output options:
 
 - **Save to** — alongside each original (default), or a directory you pick
-  anywhere on the filesystem, in which case the source tree's sub-folders
-  are recreated under it so same-named files in different folders can't
+  anywhere on the filesystem (the picker has a "New folder" field for
+  making one on the spot), in which case the source tree's sub-folders are
+  recreated under it so same-named files in different folders can't
   collide.
 - **Filename prefix/suffix** — the affix added to each output name
   (default `_upscaled`), and whether it goes before or after the name.

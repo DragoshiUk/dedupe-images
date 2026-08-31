@@ -829,6 +829,8 @@ PAGE = r"""<!doctype html>
   .modal-body li { padding:2px 0; word-break:break-all; }
   .modal-actions { padding:14px 18px; border-top:1px solid var(--border); display:flex; justify-content:flex-end; gap:10px; }
   #picker-path { padding:16px 18px; border-bottom:1px solid var(--border); font-size:13px; color:var(--text-dim); word-break:break-all; }
+  #picker-newrow { display:flex; gap:8px; padding:10px 18px; border-bottom:1px solid var(--border); }
+  #picker-newrow input { flex:1; background:var(--bg); color:var(--text); border:1px solid var(--border-strong); border-radius:var(--radius-sm); padding:6px 9px; font-size:13px; }
   #picker-list { overflow-y:auto; flex:1; padding:6px; }
   #picker-list button { display:block; width:100%; text-align:left; background:none; border:none; color:var(--text); padding:9px 11px; border-radius:var(--radius-sm); cursor:pointer; font-size:13px; }
   #picker-list button:hover { background:var(--surface-hover); }
@@ -969,6 +971,10 @@ PAGE = r"""<!doctype html>
   <div class="modal">
     <div class="modal-title" id="picker-title">Choose a directory</div>
     <div id="picker-path"></div>
+    <div id="picker-newrow" hidden>
+      <input type="text" id="picker-newname" placeholder="New folder name" spellcheck="false" autocomplete="off">
+      <button id="picker-newbtn" class="btn btn-sm">Create folder</button>
+    </div>
     <div id="picker-list"></div>
     <div id="picker-error"></div>
     <div class="modal-actions">
@@ -1459,6 +1465,10 @@ function openPicker(opts) {
   pickerCanCancel = opts.onChoose ? true : !!currentRoot;
   document.getElementById('picker-title').textContent = opts.title || 'Choose the image directory to scan';
   document.getElementById('picker-use').textContent = opts.useLabel || 'Use this directory';
+  // "New folder" only makes sense when picking a destination, not a
+  // directory to scan - opt in via allowCreate.
+  document.getElementById('picker-newrow').hidden = !opts.allowCreate;
+  document.getElementById('picker-newname').value = '';
   document.getElementById('picker-overlay').classList.add('open');
   browseTo(opts.startAt || currentRoot || null);
 }
@@ -1496,6 +1506,23 @@ document.getElementById('picker-use').onclick = async () => {
   closePicker();
   await pickerChoose(chosen);
 };
+
+async function pickerCreateFolder() {
+  const name = document.getElementById('picker-newname').value.trim();
+  if (!name || !browsePath) return;
+  const r = await fetch('/api/mkdir', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({parent: browsePath, name}),
+  });
+  const data = await r.json();
+  if (!data.ok) { document.getElementById('picker-error').textContent = data.error || 'could not create folder'; return; }
+  document.getElementById('picker-newname').value = '';
+  browseTo(data.path);  // navigate into it - it's now the current directory
+}
+document.getElementById('picker-newbtn').onclick = pickerCreateFolder;
+document.getElementById('picker-newname').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); pickerCreateFolder(); }
+});
 
 // ---------- shared: confirmation modal ----------
 
@@ -2624,6 +2651,7 @@ function renderUpscale(data) {
     title: 'Choose a directory for the upscaled images',
     useLabel: 'Save upscaled images here',
     startAt: upscaleOutDir || currentRoot || null,
+    allowCreate: true,
     onChoose: (path) => { upscaleOutDir = path; loadUpscale(); },
   });
   const resetBtn = document.getElementById('upscale-outdir-reset');
@@ -3240,6 +3268,35 @@ def make_handler(state: State):
             path = urlparse(self.path).path
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length else {}
+
+            if path == "/api/mkdir":
+                # One new directory inside an existing one, for the picker's
+                # "New folder" button (destination pickers only). Name is a
+                # single component - no separators, no traversal.
+                parent = (body.get("parent") or "").strip()
+                name = (body.get("name") or "").strip()
+                if not parent or not name:
+                    self._json({"ok": False, "error": "parent and name are required"}, status=400)
+                    return
+                if "/" in name or "\\" in name or "\x00" in name or name in (".", ".."):
+                    self._json({"ok": False, "error": "folder name can't contain a path separator"}, status=400)
+                    return
+                try:
+                    parent_p = Path(parent).expanduser().resolve()
+                except OSError as e:
+                    self._json({"ok": False, "error": str(e)}, status=400)
+                    return
+                if not parent_p.is_dir():
+                    self._json({"ok": False, "error": f"not a directory: {parent_p}"}, status=400)
+                    return
+                new_p = parent_p / name
+                try:
+                    new_p.mkdir(exist_ok=True)  # exist_ok: an existing dir just gets navigated into
+                except OSError as e:
+                    self._json({"ok": False, "error": str(e)}, status=400)
+                    return
+                self._json({"ok": True, "path": str(new_p)})
+                return
 
             if path == "/api/set-root":
                 raw = body.get("path")
