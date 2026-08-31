@@ -8,18 +8,29 @@ being actively synced from elsewhere) — operations always rescan fresh
 rather than trusting a stale plan.
 
 **Start here: `review_gui.py`** — "Image Collection Super De-Duper", a
-local browser GUI covering three operations from one page: **Identical
+local browser GUI covering four operations from one page: **Identical
 Files** (exact-hash dedupe), **Normalisation** (directory merging +
-lowercase renaming, combined), and **Visually Similar** (interactive
-perceptual near-duplicate review). Three menus: **Operations** (inspect
-each of the three above, or make Visually-Similar decisions — nothing
-runs from here), **Jobs** (Pending Jobs: tick any mix of the three,
-preview one combined summary, then Start), **Quarantine** (what's parked
-in `_duplicates_quarantine/`, with a permanent-delete option once you're
-happy). The CLI scripts (`dedupe_images.py`, `find_near_duplicates.py`,
-`apply_review.py`) still work standalone for scripting/automation, and
-the GUI is built on top of the exact same functions they use — there's
-one implementation of every safety rule, not two.
+lowercase renaming, combined), **Visually Similar** (interactive
+perceptual near-duplicate review), and **Upscale** (AI resolution
+upscaling via Real-ESRGAN). Three menus: **Operations** (inspect each of
+the first three above, make Visually-Similar decisions, or run Upscale
+directly — nothing else runs from here), **Jobs** (Pending Jobs: tick any
+mix of Identical Files / Normalisation / Visually Similar, preview one
+combined summary, then Start), **Quarantine** (every file currently
+parked in `_duplicates_quarantine/`, listed individually with what it
+was a duplicate of and when, a per-file or restore-all button, and a
+permanent-delete option once you're happy). The CLI scripts
+(`dedupe_images.py`, `find_near_duplicates.py`, `apply_review.py`) still
+work standalone for scripting/automation, and the GUI is built on top of
+the exact same functions they use — there's one implementation of every
+safety rule, not two.
+
+Upscale sits outside that quarantine/restore system entirely: it's
+additive, not destructive — it only ever writes a new
+`<name>_upscaled.<ext>` file alongside an original that's under the
+target resolution, never moves or deletes anything, so it has no manifest
+entry and nothing to restore. It has its own direct Start button on its
+own tab instead of going through Pending Jobs.
 
 Two deliberate, separately-warned exceptions to "nothing is ever
 deleted": Pending Jobs' **"skip quarantine"** checkbox permanently
@@ -57,13 +68,16 @@ uv run review_gui.py /path/to/images    # scans immediately
 - Every move is recorded in one shared `dedupe_manifest.json` inside that
   quarantine folder, written in a `finally` block so even a run that
   errors partway through still saves a manifest for whatever it
-  completed. `dedupe_images.py --restore` undoes *any* of it — GUI or
-  CLI, any of the four operations, any mix of them, right up until the
-  quarantine folder is actually deleted — because they all write to the
-  same manifest with the same schema. A permanently-deleted entry (from
-  either opt-in above) is logged as `type: "deleted"` — `--restore` skips
-  it with a clear "cannot be restored" message rather than crashing, and
-  leaves it in the manifest as a permanent record.
+  completed. That manifest can be undone right from the **Quarantine**
+  tab (Restore a single file, or Restore all) or with
+  `dedupe_images.py --restore` from the command line — both run the exact
+  same restore logic, so they stay in sync. Works for any mix of
+  Identical Files / Normalisation / Visually Similar output, right up
+  until the quarantine folder is actually deleted, because they all write
+  to the same manifest with the same schema. A permanently-deleted entry
+  (from either opt-in above) is logged as `type: "deleted"` — restoring
+  skips it with a clear "cannot be restored" message rather than
+  crashing, and leaves it in the manifest as a permanent record.
 - Perceptual (near-duplicate) matching is fuzzy by nature, so it's never
   auto-applied: a human picks which images in a group to keep by looking
   at them, and even that only produces a plan you still have to review
@@ -82,8 +96,10 @@ uv run review_gui.py /path/to/images    # scans immediately
 ## review_gui.py
 
 Menu: **Operations** (sub-tabs Identical Files / Visually Similar /
-Normalisation — inspect or decide, nothing runs from here) → **Jobs**
-(Pending Jobs: pick a mix, review, Start) → **Quarantine**.
+Normalisation / Upscale — the first three are inspect-or-decide only,
+nothing runs from there; Upscale runs directly from its own tab) →
+**Jobs** (Pending Jobs: pick a mix of the first three, review, Start) →
+**Quarantine**.
 
 **Operations → Identical Files** — `dedupe_images.py`'s SHA-256 pass,
 read-only preview. Pick a `--prefer`-equivalent keeper strategy, Rescan.
@@ -95,10 +111,33 @@ group isn't always "one true original, N copies" — sometimes near-hash-
 matches are legitimately different images (or crops/edits) worth keeping
 both of. Each image is captioned with objective numbers (resolution, an
 edge-variance sharpness estimate, file size); the highest-resolution one
-is badged "suggested" as a starting point, not a verdict. `Enter`
-confirms the current group's keep/discard split and advances; `S` skips
-without deciding; arrow keys revisit past groups. Decisions save to disk
-as you go; actually running them happens later, from Pending Jobs.
+is badged "suggested" as a starting point, not a verdict. A stat bar
+above the carousel shows the image count, position in the group list, and
+a live keep/discard split as you toggle. `Prev`/`Next` (also the arrow
+keys, or `Enter` for next) always save the current group's keep/discard
+split before moving — even if you didn't touch anything, so browsing past
+a group can never silently leave it undecided; `S` skips without
+deciding. Decisions save to disk as you go; actually running them happens
+later, from Pending Jobs. **Rescan** re-walks the directory from scratch
+(picks up anything added, removed, or quarantined since the last scan),
+restoring prior decisions for any group it rediscovers unchanged.
+
+**Operations → Upscale** — AI-upscales images (Real-ESRGAN on the GPU) so
+their longest side reaches a target resolution you set with a slider (up
+to 8192px/8K), preserving aspect ratio; an image already at or above the
+target isn't touched or listed. The eligible list updates live as you
+drag the slider. A warning appears once a lot of images are queued, since
+GPU upscaling processes one image at a time and can take a while per
+image. Output is always a new `<name>_upscaled.<ext>` file next to the
+original — nothing is moved or deleted, so unlike the other three
+operations this has no quarantine/manifest/restore involvement at all,
+and runs immediately from its own Start button rather than through
+Pending Jobs. Needs `realesrgan-ncnn-vulkan` on `PATH` (AUR:
+`realesrgan-ncnn-vulkan`) — the tab explains clearly and disables Start if
+it's missing, rather than failing partway through a run. The actual
+resize/upscale logic lives in `upscale.py` — unlike `dedupe_images.py`,
+`find_near_duplicates.py`, and `apply_review.py`, it's a library module
+for `review_gui.py` only, not a standalone command-line tool.
 
 **Operations → Normalisation** — directory-merge (`Foo`+`Foo_1` sibling
 folders) and lowercase-renaming, combined into one read-only preview.
@@ -125,11 +164,15 @@ anything actually moves. If quarantine wasn't skipped, the result message
 afterward explicitly says to visit the Quarantine tab to review and
 permanently remove the files when ready.
 
-**Quarantine** — shows what's currently sitting in
-`_duplicates_quarantine/` (file count, total size — correctly singular
-when there's exactly one), with a "Delete quarantine folder permanently"
-button gated behind a warning box and a must-tick "I understand this
-cannot be undone" checkbox before the button even becomes clickable.
+**Quarantine** — lists every file currently sitting in
+`_duplicates_quarantine/` individually (thumbnail, original path, size,
+when it was quarantined, and what file was kept instead — pulled straight
+from the manifest), not just a bare count. Each file gets its own
+**Restore** button, plus a **Restore all** button for the whole folder at
+once — both call the same restore logic as `dedupe_images.py --restore`.
+A "Delete quarantine folder permanently" button is gated behind a warning
+box and a must-tick "I understand this cannot be undone" checkbox before
+the button even becomes clickable.
 
 Directory selection: the root argument is optional (picker seeded at
 `$HOME` if omitted). The header has its own dedicated row for this —
@@ -147,8 +190,10 @@ rejected rather than queued or raced.
 
 Needs Pillow; it's a `uv` inline-script, so run via `uv run review_gui.py`
 or directly (`./review_gui.py`, it's executable) — either installs
-Pillow into an ephemeral environment automatically. Binds to `127.0.0.1`
-only, never reachable from the network.
+Pillow into an ephemeral environment automatically. The Upscale tab
+additionally needs `realesrgan-ncnn-vulkan` installed separately (a GPU
+tool, not a Python package) — every other tab works fine without it.
+Binds to `127.0.0.1` only, never reachable from the network.
 
 ```bash
 uv run review_gui.py /path/to/images

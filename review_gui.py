@@ -6,24 +6,37 @@
 Dragoshi's Super Duper Image De-Duper - local browser GUI wrapping every
 operation in this project: exact-hash dedupe ("Identical Files"),
 directory merging + lowercase normalization combined ("Normalisation"),
-and interactive perceptual near-duplicate review ("Visually Similar").
+interactive perceptual near-duplicate review ("Visually Similar"), and
+AI resolution upscaling via Real-ESRGAN ("Upscale").
 
-Menu: Operations (the three tabs above, each read-only/decision-only -
-inspect or decide, never runs anything itself) | Jobs (Pending Jobs: pick
-any mix of the three operations, review one combined summary, then Start)
-| Quarantine (what's parked in _duplicates_quarantine/, with a
-permanent-delete option once you're happy).
+Menu: Operations (four tabs - Identical Files/Normalisation/Visually
+Similar are read-only/decision-only, inspect or decide, never run
+anything themselves; Upscale is additive and self-contained instead, see
+below) | Jobs (Pending Jobs: pick any mix of Identical Files/
+Normalisation/Visually Similar, review one combined summary, then Start)
+| Quarantine (what's parked in _duplicates_quarantine/, listed file by
+file with a per-file or restore-all option, plus a permanent-delete
+option once you're happy).
+
+Upscale doesn't go through Pending Jobs/Quarantine at all - it never
+moves or deletes anything, it just writes a new "<name>_upscaled" file
+alongside any image whose longest side is under the slider's target
+resolution (up to 8192px/8K), so there's no manifest/restore story for
+it and it has its own direct Start button. Requires
+realesrgan-ncnn-vulkan on PATH; the tab explains clearly if it's missing
+rather than failing partway through a run.
 
 Nothing is deleted by a dedupe/merge/rename action itself - everything
 that would be removed is moved into _duplicates_quarantine/ with an entry
-in the shared dedupe_manifest.json, so dedupe_images.py --restore undoes
-any of it. Two explicit, separately-warned opt-ins break that safety net
-on purpose: the Jobs tab's "skip quarantine" checkbox permanently deletes
-duplicates immediately instead of quarantining them (still logged in the
-manifest as an audit trail, but --restore can't act on it), and the
-Quarantine tab's delete button permanently empties the quarantine folder.
-Both require an explicit tick/confirmation and say plainly that they
-cannot be undone.
+in the shared dedupe_manifest.json, so the Quarantine tab's Restore
+buttons (or `dedupe_images.py --restore` from the command line, same
+underlying logic) undo any of it. Two explicit, separately-warned opt-ins
+break that safety net on purpose: the Jobs tab's "skip quarantine"
+checkbox permanently deletes duplicates immediately instead of
+quarantining them (still logged in the manifest as an audit trail, but
+restore can't act on it), and the Quarantine tab's delete button
+permanently empties the quarantine folder. Both require an explicit
+tick/confirmation and say plainly that they cannot be undone.
 
 Normalisation also offers "rename conflicting files": by default, a name
 collision with genuinely different content (not a verified duplicate) is
@@ -47,6 +60,7 @@ Usage:
 """
 
 import argparse
+import io
 import json
 import mimetypes
 import os
@@ -76,12 +90,13 @@ except ModuleNotFoundError:
     sys.exit(1)
 
 from dedupe_images import (
-    DEFAULT_EXTENSIONS, MANIFEST_NAME, QUARANTINE_DIRNAME, execute_file_dedupe,
-    human, load_manifest, plan_and_maybe_execute_dir_merge,
-    plan_and_maybe_execute_lowercase, plan_file_dedupe, prune_empty_dirs,
+    CASE_STYLES, DEFAULT_EXTENSIONS, MANIFEST_NAME, QUARANTINE_DIRNAME, SEPARATOR_STYLES,
+    execute_file_dedupe, human, load_manifest, plan_and_maybe_execute_dir_merge,
+    plan_and_maybe_execute_normalize, plan_file_dedupe, prune_empty_dirs, restore_manifest_entries,
 )
 from find_near_duplicates import compute_hashes, group_by_hash, group_confidence, iter_images
 from apply_review import apply_plan, build_apply_plan
+import upscale
 
 REVIEW_DIRNAME = "_near_duplicate_review"
 DECISIONS_NAME = "decisions.json"
@@ -369,8 +384,12 @@ class State:
             if on_progress:
                 on_progress("hashing", i, total)
 
+        def group_cb(i, total):
+            if on_progress:
+                on_progress("grouping", i, total)
+
         hashes = compute_hashes(files, root, on_progress=hash_cb)
-        ordered = group_by_hash(hashes, self.threshold)
+        ordered = group_by_hash(hashes, self.threshold, on_progress=group_cb)
         total_groups = len(ordered)
         print(f"Scoring {total_groups} group(s) ...")
 
@@ -395,14 +414,14 @@ def start_scan(state: State, root: Path) -> bool:
     same "server usable immediately, groups fill in as they're scored"
     behavior."""
     def work(prog):
+        phase_idx = {"hashing": 0, "grouping": 1, "scoring": 2}
         def cb(phase, i, total):
-            idx = 0 if phase == "hashing" else 1
-            prog.phase_tick(idx, phase, i, total)
+            prog.phase_tick(phase_idx[phase], phase, i, total)
         state.scan(root, on_progress=cb)
         with state.lock:
             return {"groups_count": len(state.groups)}
 
-    return start_job("scan", phase_count=2, work_fn=work, prog=scan_progress, lock=scan_lock)
+    return start_job("scan", phase_count=3, work_fn=work, prog=scan_progress, lock=scan_lock)
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +438,7 @@ def build_identical_items(root: Path, prefer: str, delete_duplicates: bool) -> l
         for m in entry["move"]:
             sz = m.stat().st_size if m.exists() else 0
             items.append({"op": "identical", "action": action, "path": str(m.relative_to(root)),
-                          "dest": None, "kept": keep_rel, "size": sz})
+                          "dest": None, "kept": keep_rel, "size": sz, "is_dir": False})
     return items
 
 
@@ -430,17 +449,21 @@ def build_dirmerge_items(root: Path, rename_conflicts: bool, delete_duplicates: 
                                                 rename_conflicts=rename_conflicts)
     enrich_actions(root, actions)
     return [{"op": "normalise", "action": a["type"], "path": a["src"],
-             "dest": a["dest"], "kept": a["kept"], "size": a["size"]} for a in actions]
+             "dest": a["dest"], "kept": a["kept"], "size": a["size"],
+             "is_dir": a.get("is_dir", False), "was_conflict": a.get("was_conflict", False)} for a in actions]
 
 
-def build_lowercase_items(root: Path, rename_conflicts: bool, delete_duplicates: bool) -> list[dict]:
+def build_lowercase_items(root: Path, rename_conflicts: bool, delete_duplicates: bool,
+                           case_style: str, sep_style: str) -> list[dict]:
     quarantine_dir = root / QUARANTINE_DIRNAME
-    stats = plan_and_maybe_execute_lowercase(root, quarantine_dir, False, [],
+    stats = plan_and_maybe_execute_normalize(root, quarantine_dir, False, [],
                                               delete_duplicates=delete_duplicates,
-                                              rename_conflicts=rename_conflicts)
+                                              rename_conflicts=rename_conflicts,
+                                              case_style=case_style, sep_style=sep_style)
     actions = enrich_actions(root, stats["actions"])
     return [{"op": "normalise", "action": a["type"], "path": a["src"],
-             "dest": a["dest"], "kept": a["kept"], "size": a["size"]} for a in actions]
+             "dest": a["dest"], "kept": a["kept"], "size": a["size"],
+             "is_dir": a.get("is_dir", False), "was_conflict": a.get("was_conflict", False)} for a in actions]
 
 
 def build_visual_items(root: Path, decisions: dict, delete_duplicates: bool) -> list[dict]:
@@ -450,12 +473,13 @@ def build_visual_items(root: Path, decisions: dict, delete_duplicates: bool) -> 
     for keep_list, discard_rel, dpath in plan:
         sz = dpath.stat().st_size if dpath.exists() else 0
         items.append({"op": "visual", "action": action, "path": discard_rel,
-                      "dest": None, "kept": ", ".join(keep_list) or None, "size": sz})
+                      "dest": None, "kept": ", ".join(keep_list) or None, "size": sz, "is_dir": False})
     return items
 
 
 def do_build_review(root: Path, ops: list[str], prefer: str, rename_conflicts: bool,
-                     delete_duplicates: bool, state: State, prog: Progress) -> dict:
+                     delete_duplicates: bool, state: State, prog: Progress,
+                     case_style: str = "lower", sep_style: str = "none") -> dict:
     ordered_ops = [o for o in OP_ORDER if o in ops]
     phase_count = sum(2 if o == "normalise" else 1 for o in ordered_ops) or 1
 
@@ -473,7 +497,7 @@ def do_build_review(root: Path, ops: list[str], prefer: str, rename_conflicts: b
             prog.phase_tick(idx, "Normalisation: directory merge", 1, 1)
             idx += 1
             prog.phase_tick(idx, "Normalisation: lowercase names", 0, 1)
-            items.extend(build_lowercase_items(root, rename_conflicts, delete_duplicates))
+            items.extend(build_lowercase_items(root, rename_conflicts, delete_duplicates, case_style, sep_style))
             prog.phase_tick(idx, "Normalisation: lowercase names", 1, 1)
             idx += 1
         elif op == "visual":
@@ -495,7 +519,7 @@ def do_build_review(root: Path, ops: list[str], prefer: str, rename_conflicts: b
 
 
 def do_run(root: Path, ops: list[str], prefer: str, rename_conflicts: bool, delete_duplicates: bool,
-           state: State, prog: Progress) -> dict:
+           state: State, prog: Progress, case_style: str = "lower", sep_style: str = "none") -> dict:
     ordered_ops = [o for o in OP_ORDER if o in ops]
     phase_count = sum(2 if o == "normalise" else 1 for o in ordered_ops) + 1  # +1 cleanup phase
     result = {"identical": None, "normalise": None, "visual": None}
@@ -521,9 +545,10 @@ def do_run(root: Path, ops: list[str], prefer: str, rename_conflicts: bool, dele
                 prog.phase_tick(idx, "Running: Normalisation (directory merge)", 1, 1)
                 idx += 1
                 prog.phase_tick(idx, "Running: Normalisation (lowercase names)", 0, 1)
-                lc_stats = plan_and_maybe_execute_lowercase(root, quarantine_dir, True, manifest,
+                lc_stats = plan_and_maybe_execute_normalize(root, quarantine_dir, True, manifest,
                                                              delete_duplicates=delete_duplicates,
-                                                             rename_conflicts=rename_conflicts)
+                                                             rename_conflicts=rename_conflicts,
+                                                             case_style=case_style, sep_style=sep_style)
                 prog.phase_tick(idx, "Running: Normalisation (lowercase names)", 1, 1)
                 idx += 1
                 dm_counts = {"move": 0, "quarantine": 0, "delete": 0, "rename": 0, "conflict": 0}
@@ -628,6 +653,8 @@ PAGE = r"""<!doctype html>
   #subtabs button { background:none; border:none; color:var(--text-dim); padding:10px 18px; cursor:pointer; font-size:13px; font-weight:600; border-bottom:2px solid transparent; transition: color .12s, border-color .12s; }
   #subtabs button:hover { color:var(--text); }
   #subtabs button.active { color:var(--text); border-bottom-color:var(--accent); }
+  .tab-badge { display:inline-block; margin-left:7px; background:var(--accent); color:#fff; font-size:11px; font-weight:800; border-radius:10px; padding:1px 7px; vertical-align:2px; }
+  .subtab-spinner { display:inline-block; width:11px; height:11px; margin-left:7px; vertical-align:-1px; border-radius:50%; border:2px solid var(--border-strong); border-top-color:var(--accent); animation:scan-spin .7s linear infinite; }
 
   main { padding:24px; padding-bottom:64px; max-width:1400px; margin:0 auto; }
   .tabpanel { display:none; }
@@ -643,7 +670,8 @@ PAGE = r"""<!doctype html>
   .summary { color:var(--text-dim); font-size:13px; margin-bottom:14px; }
   .empty { padding:48px 20px; text-align:center; color:var(--text-dim); background:var(--surface); border:1px dashed var(--border-strong); border-radius:var(--radius); }
   .empty-hint { color:var(--text-faint); font-size:12.5px; }
-  .spinner { padding:24px; text-align:center; color:var(--text-dim); }
+  .spinner { padding:52px 24px; text-align:center; color:var(--text-dim); }
+  .spinner .ring { width:32px; height:32px; margin:0 auto 16px; border-radius:50%; border:3px solid var(--border); border-top-color:var(--accent); animation:scan-spin .8s linear infinite; }
 
   table.plan { width:100%; border-collapse:collapse; font-size:13px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; }
   table.plan th { text-align:left; color:var(--text-faint); font-weight:700; font-size:11px; letter-spacing:.04em; text-transform:uppercase; padding:9px 12px; border-bottom:1px solid var(--border); }
@@ -653,25 +681,95 @@ PAGE = r"""<!doctype html>
   table.plan tr.move td { color:#7fa8f5; }
   table.plan tr.delete td { color:#ff8f93; }
   table.plan tr.rename td { color:var(--success); }
-  .keep-badge { color:var(--success); font-weight:700; font-size:11px; text-transform:uppercase; }
+  table.plan tr.quarantine td { color:#f0a0a3; }
+  /* more specific than tr.rename above, so it wins: a rename that only
+     exists because "rename conflicting file names" resolved a naming
+     collision, not an ordinary case/separator-style rename */
+  table.plan tr.rename.conflict-resolved td { color:#e6c34d; }
+  table.plan th.sortable { cursor:pointer; user-select:none; }
+  table.plan th.sortable:hover { color:var(--text); }
   .dup-count { color:var(--text-faint); font-size:12px; }
+
+  /* ---------- Identical Files: expandable "Kept Files" rows ---------- */
+  /* Duplicates column widened to fit its own header label ("Duplicates" is
+     wider than a bare digit) - too narrow and text-align:center centers
+     each of the header/value within a box too small for the header text,
+     which then overflows and throws off the alignment between them. */
+  .kept-files-header, .kept-row { display:grid; grid-template-columns:92px 52px 1fr 18px; gap:12px; align-items:center; }
+  .kept-files-header { padding:0 12px 8px; font-size:11px; color:var(--text-faint); font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
+  .kept-files-header span.sortable { cursor:pointer; user-select:none; }
+  .kept-files-header span.sortable:hover { color:var(--text); }
+  .kept-files-header .dup-header-cell { text-align:center; }
+  .kept-files-list { display:flex; flex-direction:column; gap:8px; }
+  .kept-row-wrap { border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface); overflow:hidden; }
+  .kept-row { padding:9px 12px; cursor:pointer; transition:background .12s; }
+  .kept-row:hover { background:var(--surface-hover); }
+  .kept-row .dup-count-cell { font-weight:700; color:var(--text); font-size:15px; text-align:center; }
+  .kept-row .info { min-width:0; }
+  .kept-row .info .path { font-size:14.5px; word-break:break-all; }
+  .kept-row .info .meta { font-size:11.5px; color:var(--text-dim); margin-top:2px; }
+  .kept-row .expand-arrow { color:var(--text-faint); font-size:11px; transition:transform .15s; justify-self:end; }
+  .kept-row-wrap.expanded .expand-arrow { transform:rotate(90deg); }
+  /* max-height (not height:auto) so this can transition at all - CSS
+     can't animate to/from "auto". 2000px is just a safe ceiling, not a
+     real cap: as long as actual content stays under it (any realistic
+     duplicate-count list will), the visible expand still tracks the
+     transition duration correctly. */
+  .dup-detail { max-height:0; overflow:hidden; transition:max-height .25s ease; }
+  .kept-row-wrap.expanded .dup-detail { max-height:2000px; }
+  .dup-detail-inner { border-top:1px solid var(--border); }
+  /* Duplicates: a plain (unboxed) list, not individual thumb-row boxes -
+     a shared red-tinted background reading as "these are the ones going
+     away", starting where the kept row's own thumbnail column starts
+     (12px .kept-row left padding + 92px duplicates column + 12px grid
+     gap = 116px - keep in sync with .kept-row's grid-template-columns
+     above if those ever change) and running flush to the right edge.
+     The left border sits on the box itself, so it's one continuous line
+     down the whole list rather than being redrawn per row. */
+  .dup-plain-list { background:var(--danger-bg); border-radius:0; margin-left:116px; border-left:1px solid var(--border-strong); }
+  /* Row's own column is just the thumb + info - the duplicates-count
+     column doesn't exist here, since .dup-plain-list itself already
+     starts at that offset. Thumb column is the same 52px width as the
+     kept row's thumb column, with the (smaller) 36px thumb centered
+     within it, so it lines up horizontally with the kept image above. */
+  .dup-plain-row { display:grid; grid-template-columns:52px 1fr; gap:12px; align-items:center; padding:8px 12px 8px 0; }
+  .dup-plain-row + .dup-plain-row { border-top:1px solid rgba(255,255,255,.06); }
+  .dup-plain-row .thumb { width:36px; height:36px; justify-self:center; }
+  .dup-plain-row .info { min-width:0; }
+  .dup-plain-row .info .path { font-size:12.5px; color:#f2b6b9; word-break:break-all; }
+  .dup-plain-row .info .meta { font-size:11px; color:#d99a9c; margin-top:2px; }
 
   .group-block { margin-bottom:16px; border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; }
   .group-block .gh { background:var(--surface-hover); padding:9px 14px; font-size:12px; color:var(--text-dim); font-weight:700; }
 
   /* ---------- pending toggle (on Operations tabs) ---------- */
-  .pending-toggle { display:flex; align-items:center; gap:10px; padding:12px 14px; background:var(--accent-bg); border:1px solid var(--accent-border); border-radius:var(--radius); margin-bottom:18px; }
+  /* inline-flex (not flex): shrinks to fit its content instead of
+     stretching the full row width. That puts the checkbox/label and the
+     note right next to each other now (no more wide auto-margin gap
+     between them), so the note gets its own left border as a clear
+     divider instead, rather than relying on distance to separate them. */
+  .pending-toggle { display:inline-flex; align-items:center; gap:10px; padding:10px 14px; background:var(--accent-bg); border:1px solid var(--accent-border); border-radius:var(--radius); margin-bottom:18px; }
   .pending-toggle.disabled { background:var(--surface); border-color:var(--border); opacity:.7; }
   .pending-toggle label { font-weight:700; font-size:13.5px; cursor:pointer; }
   .pending-toggle.disabled label { cursor:not-allowed; color:var(--text-dim); }
-  .pending-toggle .pending-note { color:var(--text-dim); font-size:12.5px; margin-left:auto; }
+  .pending-toggle .pending-note { color:var(--text-dim); font-size:12.5px; padding-left:12px; margin-left:2px; border-left:1px solid var(--accent-border); white-space:nowrap; }
+  .pending-toggle.disabled .pending-note { border-left-color:var(--border-strong); }
 
   /* ---------- visually similar review ---------- */
   #progress-track { flex:1; min-width:160px; }
   .bar { height:8px; background:var(--border); border-radius:4px; overflow:hidden; }
   .bar-fill { height:100%; background:var(--success); transition:width .2s; }
   #progress-label { font-size:12px; color:var(--text-dim); margin-top:5px; }
-  #groupmeta { color:var(--text-dim); font-size:13px; margin:16px 0 14px; }
+  /* Prominent stat bar - three segments (image count / group position /
+     live keep-discard split) divided by vertical rules, matching the
+     divider treatment already used in .pending-toggle .pending-note. */
+  .nd-stats { display:flex; align-items:center; margin:16px 0 14px; padding:14px 20px; background:var(--surface); border:1px solid var(--border-strong); border-radius:var(--radius); font-size:16px; color:var(--text-dim); }
+  .nd-stats .nd-stat { padding:0 22px; }
+  .nd-stats .nd-stat:first-child { padding-left:0; }
+  .nd-stats .nd-stat + .nd-stat { border-left:1px solid var(--border-strong); }
+  .nd-stats .nd-stat b { color:var(--text); font-weight:700; }
+  .nd-stats #nd-keep-count { color:var(--success); }
+  .nd-stats #nd-discard-count { color:var(--danger); }
   #cards-wrap { display:flex; align-items:center; gap:10px; }
   #cards { display:flex; flex-wrap:nowrap; gap:16px; overflow-x:auto; scroll-behavior:smooth; scrollbar-width:thin; padding-bottom:4px; flex:1; min-width:0; cursor:grab; user-select:none; }
   #cards.dragging { cursor:grabbing; }
@@ -721,21 +819,7 @@ PAGE = r"""<!doctype html>
   #progress-overlay .modal-body { text-align:center; padding:28px 18px; }
   #progress-overlay .big-pct { font-size:34px; font-weight:800; margin-bottom:12px; color:var(--accent); }
 
-  /* scan overlay: lighter/blurred backdrop than the standard modals so the
-     webui reads as "about to be ready" behind it, not fully hidden */
-  #scan-overlay { background:rgba(8,9,11,.45); backdrop-filter:blur(2px); -webkit-backdrop-filter:blur(2px); }
-  #scan-overlay .modal { width:min(420px, 90vw); }
-  #scan-overlay .modal-body { text-align:center; padding:34px 26px; }
-  .scan-spinner {
-    width:54px; height:54px; margin:0 auto 22px; border-radius:50%;
-    background:conic-gradient(from 0deg, var(--accent) 0deg, transparent 300deg);
-    -webkit-mask:radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 5px));
-    mask:radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 5px));
-    animation:scan-spin .85s linear infinite;
-  }
   @keyframes scan-spin { to { transform:rotate(360deg); } }
-  #scan-status-text { font-size:14.5px; font-weight:600; color:var(--text); margin-bottom:4px; }
-  #scan-pct { font-size:12px; color:var(--text-dim); margin-top:8px; }
 
   /* ---------- bottom status bar (background scan/scoring) ---------- */
   #status-bar {
@@ -744,7 +828,14 @@ PAGE = r"""<!doctype html>
     padding:10px 20px; transform:translateY(100%); transition:transform .25s ease;
   }
   #status-bar.open { transform:translateY(0); }
-  #status-bar-inner { display:flex; align-items:center; gap:14px; font-size:13px; color:var(--text-dim); max-width:1400px; margin:0 auto; }
+  /* #status-bar-inner fills up to 1400px and is itself page-centered via
+     margin:auto, but that alone doesn't center its *content* within that
+     (invisible, background-less) box - flex items default to
+     justify-content:flex-start, so the text+bar cluster was sitting
+     flush against the inner box's left edge: neither flush with the true
+     viewport edge nor centered on the page, just an awkward in-between
+     depending on viewport width. justify-content:center fixes that. */
+  #status-bar-inner { display:flex; align-items:center; justify-content:center; gap:14px; font-size:13px; color:var(--text-dim); max-width:1400px; margin:0 auto; }
   #status-bar-text { flex-shrink:0; white-space:nowrap; }
   #status-bar .bar { flex:1; max-width:280px; }
 
@@ -760,8 +851,13 @@ PAGE = r"""<!doctype html>
   .thumb-grid { display:flex; flex-direction:column; gap:8px; }
   .thumb-row { display:flex; align-items:center; gap:12px; padding:9px 12px; border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--surface); }
   .thumb-row.conflict { border-color:var(--danger-border); background:var(--danger-bg); }
-  .thumb-row .thumb { width:52px; height:52px; object-fit:cover; border-radius:6px; background:var(--bg); flex-shrink:0; }
-  .thumb-row .thumb.placeholder { display:flex; align-items:center; justify-content:center; color:var(--text-faint); font-size:10px; }
+  /* Unscoped (not .thumb-row .thumb): thumbHtml() is shared by the Jobs
+     tab's .thumb-row list AND Identical Files' .kept-row grid, which
+     isn't a .thumb-row - scoping this to .thumb-row left .kept-row's
+     thumbnail with no size constraint at all, rendering at full native
+     resolution and blowing out the page. */
+  .thumb { width:52px; height:52px; object-fit:cover; border-radius:6px; background:var(--bg); flex-shrink:0; }
+  .thumb.placeholder { display:flex; align-items:center; justify-content:center; color:var(--text-faint); font-size:10px; }
   .thumb-row .info { flex:1; min-width:0; }
   .thumb-row .info .path { font-weight:600; font-size:13px; word-break:break-all; }
   .thumb-row .info .meta { font-size:11.5px; color:var(--text-dim); margin-top:2px; }
@@ -775,8 +871,21 @@ PAGE = r"""<!doctype html>
 
   .quarantine-status { padding:22px; border:1px solid var(--border); border-radius:var(--radius); background:var(--surface); margin-bottom:16px; }
   .quarantine-status .big { font-size:24px; font-weight:800; margin-bottom:6px; }
+
+  /* ---------- upscale ---------- */
+  .upscale-slider-row { display:flex; align-items:center; gap:14px; padding:16px 18px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); margin-bottom:16px; flex-wrap:wrap; }
+  .upscale-slider-row label { font-weight:600; font-size:13.5px; white-space:nowrap; }
+  .upscale-slider-row input[type=range] { flex:1; min-width:220px; accent-color:var(--accent); height:6px; cursor:pointer; }
+  .upscale-target-value { color:var(--accent); font-weight:700; }
+  .upscale-summary { color:var(--text-dim); font-size:13px; margin-bottom:14px; }
   .warn-box { background:var(--danger-bg); border:1px solid var(--danger-border); border-radius:var(--radius); padding:14px 16px; color:#f2b6b9; font-size:13px; margin-bottom:12px; }
   .warn-box b { color:#ffcdcf; }
+  /* solid yellow outline, faded/low-opacity yellow fill - distinct from
+     the red .warn-box above, used for "here's a conflict, here's your
+     option" rather than "this is destructive/irreversible" */
+  .warn-box.warn-yellow { background:rgba(230,180,30,.12); border:2px solid #e6b41e; color:#e8d29a; }
+  .warn-box.warn-yellow b { color:#f5da8a; }
+  .warn-box.warn-yellow label { cursor:pointer; }
 
   /* ---------- decorative background easter egg (purely cosmetic) ----------
      Fixed behind everything (negative z-index) and pointer-events:none,
@@ -810,19 +919,21 @@ PAGE = r"""<!doctype html>
 </header>
 <div id="tabs">
   <button data-tab="operations" class="active">Operations</button>
-  <button data-tab="jobs">Jobs</button>
-  <button data-tab="quarantine">Quarantine</button>
+  <button data-tab="jobs">Jobs<span class="tab-badge" id="jobs-badge" style="display:none"></span></button>
+  <button data-tab="quarantine">Quarantine<span class="tab-badge" id="quarantine-badge" style="display:none"></span></button>
 </div>
 <div id="subtabs">
-  <button data-subtab="identical" class="active">Identical Files</button>
-  <button data-subtab="visual">Visually Similar</button>
-  <button data-subtab="normalise">Normalisation</button>
+  <button data-subtab="identical" class="active">Identical Files<span class="subtab-spinner" id="spin-identical" style="display:none"></span></button>
+  <button data-subtab="visual">Visually Similar<span class="subtab-spinner" id="spin-visual" style="display:none"></span></button>
+  <button data-subtab="normalise">Normalisation<span class="subtab-spinner" id="spin-normalise" style="display:none"></span></button>
+  <button data-subtab="upscale">Upscale<span class="subtab-spinner" id="spin-upscale" style="display:none"></span></button>
 </div>
 <main>
   <div id="tab-operations" class="tabpanel active">
     <div id="sub-identical" class="subpanel"></div>
     <div id="sub-visual" class="subpanel" style="display:none"></div>
     <div id="sub-normalise" class="subpanel" style="display:none"></div>
+    <div id="sub-upscale" class="subpanel" style="display:none"></div>
   </div>
   <div id="tab-jobs" class="tabpanel"></div>
   <div id="tab-quarantine" class="tabpanel"></div>
@@ -862,17 +973,6 @@ PAGE = r"""<!doctype html>
   </div>
 </div>
 
-<div id="scan-overlay" class="overlay">
-  <div class="modal">
-    <div class="modal-body">
-      <div class="scan-spinner"></div>
-      <div id="scan-status-text">Comparing and grouping hashes&hellip;</div>
-      <div class="bar"><div class="bar-fill" id="scan-fill" style="width:0%"></div></div>
-      <div id="scan-pct">0%</div>
-    </div>
-  </div>
-</div>
-
 <div id="status-bar">
   <div id="status-bar-inner">
     <span id="status-bar-text"></span>
@@ -898,6 +998,25 @@ function human(n) {
 }
 function isImageExt(p) {
   return /\.(png|jpe?g|gif|bmp|webp|tiff?)$/i.test(p);
+}
+function formatWhen(iso) {
+  const d = new Date(iso);
+  return isNaN(d) ? iso : d.toLocaleString();
+}
+
+// Shared thumbnail-or-placeholder markup (Jobs tab, and Identical Files'
+// kept-file/duplicate rows). An actual thumbnail for images; otherwise a
+// placeholder labeled with the file's extension (SWF, PSD, ...) rather
+// than a generic "file", or DIR for directories - much more useful at a
+// glance when a plan mixes several different file types.
+function extLabel(path) {
+  const m = /\.([a-zA-Z0-9]+)$/.exec(path);
+  return m ? m[1].toUpperCase() : 'FILE';
+}
+function thumbHtml(path, isDir) {
+  if (isDir) return `<div class="thumb placeholder">DIR</div>`;
+  if (isImageExt(path)) return `<img class="thumb" src="/img/${encodeURIComponent(path)}" loading="lazy">`;
+  return `<div class="thumb placeholder">${esc(extLabel(path))}</div>`;
 }
 
 const OP_LABELS = {identical: 'Identical Files', normalise: 'Normalisation', visual: 'Visually Similar'};
@@ -949,29 +1068,144 @@ async function runJob(title, startUrl, startBody) {
   return final.result;
 }
 
-// ---------- background directory scan (hash+group, then incremental scoring) ----------
+// ---------- per-tab loading state (big spinner in the panel, small
+// spinner next to the sub-tab's name) ----------
 //
-// Hashing+grouping (phase_index 0) has nothing to show yet - Hamming-
-// distance grouping needs every hash before it can form any cluster - so
-// that part still gets a blocking modal (a light/blurred backdrop rather
-// than the usual opaque one, so the webui reads as "about to be ready").
-// The moment scoring starts (phase_index 1) the modal closes and a
-// persistent bottom status bar takes over instead, because scoring is
-// genuinely incremental: state.groups grows one group at a time on the
-// server, so results can - and do - load in as they're ready.
+// Each of the three Operations sub-tabs loads independently and shows its
+// own pair of spinners until its own data is ready - no more single
+// blocking modal for the whole directory. identical/normalise are simple
+// stateless fetches; visual's "loading" instead tracks the scan's
+// hash+group phase (see pollScan below), since that's the part with
+// nothing to show yet - Hamming-distance grouping needs every hash before
+// it can form any cluster at all.
+
+let tabLoading = {identical: false, visual: false, normalise: false, upscale: false};
+
+// pct is optional - identical/normalise don't have a meaningful one (a
+// single fetch, not an incremental job), so it's only ever passed for the
+// Visually Similar scan. Without it, the spinner used to sit there with no
+// number at all through the whole hash+group phase - completely
+// indistinguishable from actually being stuck, which is what prompted this.
+function bigSpinnerHtml(label, pct) {
+  const bar = (typeof pct === 'number')
+    ? `<div class="bar" style="max-width:220px;margin:14px auto 0"><div class="bar-fill spinner-bar-fill" style="width:${pct}%"></div></div>` +
+      `<div class="spinner-pct-text" style="margin-top:6px;font-size:12px;color:var(--text-dim)">${pct}%</div>`
+    : '';
+  return `<div class="spinner"><div class="ring"></div><span class="spinner-label-text">${esc(label)}</span>&hellip;${bar}</div>`;
+}
+
+// Updates an already-rendered big spinner's label/percentage in place,
+// without touching the .ring element. The Visually Similar scan gets a
+// fresh percentage roughly every 500ms while hashing/grouping (see
+// pollScan), far more often than the ring's own ~0.8s rotation -
+// overwriting the whole panel via innerHTML on every tick was recreating
+// the ring element itself each time, resetting its CSS animation before a
+// single rotation could ever finish. That's what looked like a stuttering
+// spin that never completed - it was a brand new element with a brand new
+// animation, over and over, never the same one running continuously.
+function updateSpinnerInPlace(panel, label, pct) {
+  const labelEl = panel.querySelector('.spinner-label-text');
+  if (labelEl) labelEl.textContent = label;
+  if (typeof pct === 'number') {
+    const barFill = panel.querySelector('.spinner-bar-fill');
+    const pctText = panel.querySelector('.spinner-pct-text');
+    if (barFill) barFill.style.width = pct + '%';
+    if (pctText) pctText.textContent = pct + '%';
+  }
+}
+
+// A fetch that fails (network error, or the server closing the
+// connection on an unhandled exception) used to leave tabLoading stuck
+// true forever with no feedback at all - the spinner text just sat there
+// permanently since nothing after the failed fetch ever ran to clear it.
+// Every load path below now wraps its fetch in try/catch and calls this
+// on failure, so a real error is at least visible and retryable instead
+// of an indefinite, silent hang.
+function loadErrorHtml(title, err, retryId) {
+  return `<h2 class="page-title">${esc(title)}</h2><div class="empty">Failed to load: ${esc(err && err.message || String(err))}` +
+    `<br><span class="empty-hint">Check the terminal running review_gui.py for details.</span><br><br>` +
+    `<button class="btn" id="${retryId}">Retry</button></div>`;
+}
+
+// Small spinner (next to the sub-tab's name) is tracked separately from
+// the big one for 'visual': that tab's underlying scan has two phases,
+// and only the first (hashing/grouping - nothing reviewable exists yet)
+// should hide real content behind the big spinner. But the small spinner
+// is meant to answer "is this operation still working at all", which
+// spans the *whole* scan including scoring - clearing it once scoring
+// starts (even though groups are still actively being found) read as
+// "done" when it very much wasn't, which was confusing. So identical/
+// normalise (no phases, one fetch = fully loading or fully done) keep
+// using setTabLoading for both spinners together; 'visual' additionally
+// drives this one on its own from pollScan(), independent of tabLoading.visual.
+function setSmallSpinner(key, visible) {
+  const spin = document.getElementById('spin-' + key);
+  if (spin) spin.style.display = visible ? 'inline-block' : 'none';
+}
+
+// loading=true also immediately paints the big spinner into that tab's
+// panel (even if it's not the active tab right now - harmless, and means
+// switching to it mid-load shows the spinner instead of stale/blank
+// content). loading=false only clears the small spinner; the caller is
+// responsible for rendering real content right after.
+function setTabLoading(key, loading, label, pct) {
+  tabLoading[key] = loading;
+  setSmallSpinner(key, loading);
+  if (loading) {
+    const panel = document.getElementById('sub-' + key);
+    if (!panel) return;
+    // If a spinner is already showing (e.g. pollScan calling this again
+    // with an updated percentage), update its text/bar in place rather
+    // than rebuilding the whole panel - see updateSpinnerInPlace's note.
+    if (panel.querySelector('.spinner .ring')) {
+      updateSpinnerInPlace(panel, label || 'Loading', pct);
+    } else {
+      panel.innerHTML = bigSpinnerHtml(label || 'Loading', pct);
+    }
+  }
+}
+
+// Kicks off all three Operations tabs' loads in parallel - called
+// whenever the chosen directory changes (picker confirm, or boot with an
+// already-known root), so every sub-tab's spinner is live from the start
+// regardless of which one happens to be active.
+async function startAllTabLoads() {
+  identicalData = null;
+  normaliseData = null;
+  upscaleData = null;
+  ndGroups = [];
+  ndDecisions = {};
+  visualLoaded = false;
+  updateJobsBadge();
+  refreshQuarantineBadge();
+  // The near-duplicate scan is already running server-side by this point
+  // (kicked off by /api/set-root before this function is even called) -
+  // pollScan() just polls its status, which is cheap and doesn't compete
+  // for the GIL, so start it (and paint its spinners) immediately.
+  // pct:0 (not omitted) so the percentage bar/text exist in the DOM from
+  // this very first paint - pollScan()'s first tick (and every one after)
+  // then only ever updates that existing bar/text in place, never
+  // recreating the spinner, which is what keeps its animation continuous.
+  setTabLoading('visual', true, 'Hashing images', 0);
+  setSmallSpinner('visual', true);  // stays lit through pollScan()'s whole run, not just this initial paint
+  pollScan();
+  // Identical Files and Normalisation both hash their way through every
+  // file (SHA-256) - real CPU-bound work that, under Python's GIL,
+  // doesn't truly run in parallel with the scan's own per-image hashing
+  // happening at the same time. Firing both of these at once on top of
+  // that just made everything contend and slow each other down on a
+  // large real directory, which is what large-directory "stuck on
+  // Scanning" reports turned out to be. Sequencing these two remains
+  // just one await apart from the caller's perspective, but halves that
+  // particular contention.
+  await loadIdentical();
+  await loadNormalise();
+  await loadUpscale();
+}
 
 let scanActive = false;   // read by renderVisual() to word its empty state
 let scanPolling = false;  // re-entrancy guard - only one poll loop at a time
 
-function showScanOverlay() {
-  document.getElementById('scan-status-text').textContent = 'Comparing and grouping hashes…';
-  document.getElementById('scan-fill').style.width = '0%';
-  document.getElementById('scan-pct').textContent = '0%';
-  document.getElementById('scan-overlay').classList.add('open');
-}
-function hideScanOverlay() {
-  document.getElementById('scan-overlay').classList.remove('open');
-}
 function showStatusBar(text, pct) {
   document.getElementById('status-bar-text').textContent = text;
   document.getElementById('status-bar-fill').style.width = pct + '%';
@@ -981,20 +1215,30 @@ function hideStatusBar() {
   document.getElementById('status-bar').classList.remove('open');
 }
 
-// Re-fetches the current group list/decisions and, if new groups have
-// arrived, re-renders - but only when that's actually safe: skip it while
-// the user is mid-way through toggling the group they're currently looking
-// at (ndTouched), so a background poll can never wipe an unsaved toggle.
+// Re-fetches the current group list/decisions and updates them quietly in
+// the background - only actually touching the DOM (renderVisual(), which
+// rebuilds the whole panel including the carousel) when what's currently
+// on screen would otherwise go stale. New groups are always appended
+// after existing ones and never mutated, so if ndIdx is still pointing at
+// an already-available group, that group's content can't have changed -
+// re-rendering on every poll tick while the user is just sitting there
+// (or scrolling the carousel) was tearing down and rebuilding the whole
+// panel every ~500ms during active scoring, which is what was seen as
+// the carousel/scroll-buttons "flashing".
+//
+// ndIdx >= (old) ndGroups.length covers both cases where the currently
+// displayed screen genuinely does depend on whether more groups exist:
+// the empty "nothing yet"/"still scanning" state (ndIdx 0 >= length 0),
+// and the "all reviewed!" state (ndIdx deliberately pushed to
+// ndGroups.length once nothing is left undecided) - newly arrived groups
+// should be reflected right away in both.
 async function refreshVisualGroupsQuietly() {
   const r = await fetch('/api/nd/groups');
   const data = await r.json();
-  // was, and still is, showing the "nothing yet" screen - re-render even
-  // without new groups so its "still scanning" wording stays current
-  const stillEmpty = ndGroups.length === 0 && data.groups.length === 0;
-  const grew = data.groups.length !== ndGroups.length;
+  const staleOnScreen = ndIdx >= ndGroups.length;
   ndGroups = data.groups;
   ndDecisions = data.decisions;
-  if ((grew || stillEmpty) && activeTab === 'operations' && activeSubtab === 'visual' && !ndTouched) {
+  if (staleOnScreen && activeTab === 'operations' && activeSubtab === 'visual' && !ndTouched) {
     renderVisual();
   }
 }
@@ -1004,26 +1248,60 @@ async function pollScan() {
   scanPolling = true;
   try {
     while (true) {
-      const r = await fetch('/api/scan-progress');
-      const p = await r.json();
+      let p;
+      try {
+        const r = await fetch('/api/scan-progress');
+        p = await r.json();
+      } catch (e) {
+        setTabLoading('visual', false);
+        setSmallSpinner('visual', false);
+        if (activeTab === 'operations' && activeSubtab === 'visual') {
+          document.getElementById('sub-visual').innerHTML = loadErrorHtml('Visually Similar', e, 'visual-retry');
+          document.getElementById('visual-retry').onclick = () => { scanPolling = false; pollScan(); };
+        }
+        break;
+      }
       scanActive = p.active;
-      if (!p.active && !p.done) break;  // no scan has ever run this session
-      if (p.active && p.phase_index === 0) {
-        hideStatusBar();
-        showScanOverlay();
-        document.getElementById('scan-fill').style.width = p.pct + '%';
-        document.getElementById('scan-pct').textContent = p.pct + '%';
+      // phase_index stays under 2 (0=hashing, 1=grouping) both during
+      // genuine hashing/grouping AND briefly right after a scan is
+      // requested but before its background thread has actually called
+      // Progress.begin() yet (every caller of pollScan only does so once
+      // it knows a scan should be running, so that race - not "no scan
+      // will ever happen" - is the only way to see active:false/done:false
+      // here). It also stays under 2 for a scan that finds zero candidate
+      // groups, since the scoring phase it would otherwise advance into
+      // never runs - hence "&& !p.done" so that case still counts as
+      // finished, not stuck loading forever.
+      const stillInHashPhase = p.phase_index < 2 && !p.done;
+      const justLeftHashPhase = tabLoading.visual && !stillInHashPhase;
+      if (stillInHashPhase) {
+        // grouping (all-pairs Hamming-distance comparison) is the other
+        // half of this - same "nothing to show yet" reasoning as hashing,
+        // but a distinct label + its own percentage (it only ticks every
+        // 50k pairs server-side - see group_by_hash - not a smooth
+        // per-file count like hashing), so it doesn't look like hashing
+        // got stuck at 100% for however long grouping takes.
+        const within = p.total ? Math.round(100 * p.current / p.total) : 0;
+        const label = p.phase_index === 0 ? 'Hashing images' : 'Comparing hashes to find matches';
+        setTabLoading('visual', true, label, within);
       } else {
-        hideScanOverlay();
+        setTabLoading('visual', false);
+      }
+      setSmallSpinner('visual', !p.done);  // stays lit through scoring too, only clears once the whole scan is done
+      if (!stillInHashPhase) {
         if (p.active) {
           showStatusBar(`Scoring images for review: ${plural(p.current, 'group')} ready`, p.pct);
-        } else {
+        } else if (p.done) {
           showStatusBar('Scan complete', 100);
         }
-        await refreshVisualGroupsQuietly();
+        // The first time content becomes available this scan, do a real
+        // load (fetch + position on the first undecided group) rather
+        // than the lightweight incremental merge, which intentionally
+        // never touches ndIdx so it doesn't yank a reviewer around mid-review.
+        if (justLeftHashPhase) await loadVisualData();
+        else if (p.active || p.done) await refreshVisualGroupsQuietly();
       }
       if (p.done) {
-        hideScanOverlay();
         await refreshVisualGroupsQuietly();
         setTimeout(hideStatusBar, 1500);
         break;
@@ -1127,8 +1405,9 @@ document.getElementById('picker-use').onclick = async () => {
   });
   const started = await r.json();
   if (!started.ok) { alert(started.error || 'could not start scan'); return; }
-  pollScan();  // not awaited - runs in the background (scan overlay, then
-               // the status bar) while the rest of the UI becomes usable
+  startAllTabLoads();  // not awaited - all four Operations tabs load in
+                        // the background (each with its own spinner) while
+                        // the rest of the UI becomes usable immediately
   // state.root is set essentially the instant the scan job starts, but
   // there's a small window before that background thread actually runs -
   // wait (briefly, bounded) for it to land so tabs don't flash "no
@@ -1253,12 +1532,24 @@ async function reloadActive() {
     document.querySelectorAll('.subpanel').forEach(p => p.innerHTML = msg);
     document.getElementById('tab-jobs').innerHTML = msg;
     document.getElementById('tab-quarantine').innerHTML = msg;
+    document.getElementById('jobs-badge').style.display = 'none';
+    document.getElementById('quarantine-badge').style.display = 'none';
     return;
   }
   if (activeTab === 'operations') {
-    if (activeSubtab === 'identical') loadIdentical();
-    if (activeSubtab === 'visual') loadVisual();
-    if (activeSubtab === 'normalise') loadNormalise();
+    // Re-render from what's already cached (from startAllTabLoads's
+    // proactive background load, or an earlier visit) instead of always
+    // re-fetching - identical/normalise recompute their whole plan on
+    // every fetch (real filesystem work, with server-side console output
+    // for a large tree), so re-fetching on every plain tab click meant
+    // real rescanning and the whole table flashing/repopulating each
+    // time you switched back to it. Explicit refresh triggers (Rescan,
+    // the prefer/rename-conflicts options, a completed Run) call
+    // loadIdentical()/loadNormalise() directly and still always fetch.
+    if (activeSubtab === 'identical') { identicalData ? renderIdentical(identicalData) : loadIdentical(); }
+    if (activeSubtab === 'visual') { if (!tabLoading.visual) { visualLoaded ? renderVisual() : loadVisual(); } }
+    if (activeSubtab === 'normalise') { normaliseData ? renderNormalise(normaliseData) : loadNormalise(); }
+    if (activeSubtab === 'upscale') { upscaleData ? renderUpscale(upscaleData) : loadUpscale(); }
   }
   if (activeTab === 'jobs') loadJobs();
   if (activeTab === 'quarantine') loadQuarantine();
@@ -1281,8 +1572,39 @@ function wirePendingToggle(key) {
   if (!cb) return;
   cb.onchange = () => {
     pendingOps[key] = cb.checked;
+    updateJobsBadge();
     if (activeTab === 'jobs') loadJobs();
   };
+}
+
+// Jobs badge count is derived entirely client-side from each tab's
+// already-fetched preview data (identicalData/normaliseData/ndDecisions) -
+// no extra server round-trip, so it can update instantly on every toggle
+// or decision. It's an estimate (matches what a real build would count,
+// assuming the filesystem hasn't changed since each tab last loaded) -
+// visiting the Jobs tab still runs the authoritative build.
+function updateJobsBadge() {
+  let n = 0;
+  if (pendingOps.identical && identicalData) n += identicalData.total_files;
+  if (pendingOps.normalise && normaliseData) n += normaliseData.actions.length;
+  if (pendingOps.visual) n += ndDiscardTotal();
+  const badge = document.getElementById('jobs-badge');
+  if (n > 0) { badge.textContent = n; badge.style.display = 'inline-block'; }
+  else { badge.style.display = 'none'; }
+}
+
+async function refreshQuarantineBadge() {
+  try {
+    const r = await fetch('/api/quarantine/status');
+    const data = await r.json();
+    const badge = document.getElementById('quarantine-badge');
+    if (data.exists && data.file_count > 0) { badge.textContent = data.file_count; badge.style.display = 'inline-block'; }
+    else { badge.style.display = 'none'; }
+    return data;
+  } catch (e) {
+    return null;  // called both fire-and-forget (startAllTabLoads) and for its
+                  // return value (loadQuarantine) - the latter handles null itself
+  }
 }
 
 // ---------- Visually Similar sub-tab ----------
@@ -1290,17 +1612,42 @@ function wirePendingToggle(key) {
 let ndGroups = [], ndDecisions = {}, ndIdx = 0;
 let ndPending = {};
 let ndTouched = false;  // true once the current group's keep/discard has been changed since it was shown
+let visualLoaded = false;  // true once loadVisualData() has fetched at least once this scan - lets reloadActive() re-render from memory on a plain revisit instead of re-fetching
 
-async function loadVisual() {
-  const panel = document.getElementById('sub-visual');
-  panel.innerHTML = '<div class="spinner">Loading&hellip;</div>';
-  const r = await fetch('/api/nd/groups');
-  const data = await r.json();
-  ndGroups = data.groups;
-  ndDecisions = data.decisions;
+function ndPositionToFirstUndecided() {
   ndIdx = ndGroups.findIndex(g => !ndDecisions[g.id]);
   if (ndIdx === -1) ndIdx = 0;
-  renderVisual();
+}
+
+// Fetches the current groups/decisions and positions on the first
+// undecided one - shared by loadVisual() (a manual tab visit) and
+// pollScan() (the moment the scan's hash/group phase ends and there's
+// real content to show for the first time).
+async function loadVisualData() {
+  try {
+    const r = await fetch('/api/nd/groups');
+    const data = await r.json();
+    ndGroups = data.groups;
+    ndDecisions = data.decisions;
+    ndPositionToFirstUndecided();
+    visualLoaded = true;
+    if (activeTab === 'operations' && activeSubtab === 'visual') renderVisual();
+  } catch (e) {
+    // Don't rethrow: this is also called from pollScan()'s loop, which
+    // should keep polling scan status even if this one fetch failed - a
+    // later tick calling refreshVisualGroupsQuietly() can still recover.
+    if (activeTab === 'operations' && activeSubtab === 'visual') {
+      document.getElementById('sub-visual').innerHTML = loadErrorHtml('Visually Similar', e, 'visual-retry');
+      document.getElementById('visual-retry').onclick = loadVisualData;
+    }
+  }
+}
+
+async function loadVisual() {
+  if (tabLoading.visual) return;  // still in the scan's hash/group phase - pollScan will render once ready
+  const panel = document.getElementById('sub-visual');
+  panel.innerHTML = bigSpinnerHtml('Loading');
+  await loadVisualData();
 }
 
 function ndFirstUndecidedFrom(start) {
@@ -1318,12 +1665,18 @@ function ndStartPending(g) {
   });
 }
 
-// Saves the current group's keep/discard split (same save this group would
-// get from pressing Enter) if it's been changed since it was shown - used
-// so navigating away with the arrow keys/prev/next doesn't silently
-// discard toggles you made but didn't explicitly confirm.
-async function ndSaveIfTouched() {
-  if (!ndTouched) return;
+// Saves the current group's keep/discard split - called on every
+// prev/next navigation (buttons and arrow keys alike), unconditionally,
+// not just when something was toggled. There used to be a separate
+// "Confirm & next" button and this only fired on an actual toggle
+// (ndTouched), so simply browsing to a group and moving on without
+// touching a card left it permanently undecided - excluded from
+// ndDecisions and therefore never applied, even though nothing looked
+// wrong in the UI. Now prev/next always commit the current keep/discard
+// split (even an all-kept "nothing to discard here" one), exactly like
+// the old Confirm button did, so every group you pass through ends up
+// recorded.
+async function ndSaveCurrent() {
   const g = ndGroups[ndIdx];
   if (!g) return;
   const keep = g.images.map(im => im.path).filter(p => ndPending[p] !== 'discard');
@@ -1356,9 +1709,28 @@ function wireNdReset() {
         ndDecisions = {};
         ndIdx = 0;
         pendingOps.visual = false;
+        updateJobsBadge();
         loadVisual();
       },
       { confirmLabel: 'Reset' });
+  };
+}
+
+// Re-walks the tree from scratch - picks up anything quarantined, deleted
+// or added since the last scan. Disabled while a scan (this one or the
+// initial one) is already running, since the backend only allows one at a
+// time anyway; disabling avoids a pointless "already running" error alert.
+function visualRescanRowHtml() {
+  return `<div class="toolbar"><button class="btn" id="visual-rescan" ${scanActive ? 'disabled' : ''}>Rescan</button></div>`;
+}
+function wireVisualRescan() {
+  document.getElementById('visual-rescan').onclick = async () => {
+    const r = await fetch('/api/nd/rescan', {method: 'POST'});
+    const result = await r.json();
+    if (!result.ok) { alert(result.error || 'rescan failed'); return; }
+    setTabLoading('visual', true, 'Hashing images', 0);
+    setSmallSpinner('visual', true);
+    pollScan();
   };
 }
 
@@ -1371,20 +1743,23 @@ function renderVisual() {
   // isLeavingVisualEmptyHanded()/showLeaveVisualWarning()
   const toggle = pendingToggleHtml('visual', noGroups,
     noGroups ? 'Nothing to review' : discardCount === 0 ? 'No decisions yet' : `${plural(discardCount, 'file')} staged to discard`);
+  const rescanRow = visualRescanRowHtml();
 
   if (ndGroups.length === 0) {
     const emptyMsg = scanActive
       ? 'Still scanning for candidate groups&hellip; hang tight, groups will appear here as they\'re scored.'
       : 'No candidate groups found in this directory.';
-    panel.innerHTML = `<h2 class="page-title">Visually Similar</h2>${toggle}<div class="empty">${emptyMsg}</div>`;
+    panel.innerHTML = `<h2 class="page-title">Visually Similar</h2>${toggle}${rescanRow}<div class="empty">${emptyMsg}</div>`;
     wirePendingToggle('visual');
+    wireVisualRescan();
     return;
   }
   const decidedCount = Object.keys(ndDecisions).length;
   const resetRow = ndResetRowHtml(decidedCount);
   if (decidedCount === ndGroups.length) {
-    panel.innerHTML = `<h2 class="page-title">Visually Similar</h2>${toggle}${resetRow}<div class="empty">All groups reviewed! ${plural(discardCount, 'file')} staged to discard.<br><span class="empty-hint">Add to Pending Jobs above, then go to the Jobs tab to run it.</span></div>`;
+    panel.innerHTML = `<h2 class="page-title">Visually Similar</h2>${toggle}${rescanRow}${resetRow}<div class="empty">All groups reviewed! ${plural(discardCount, 'file')} staged to discard.<br><span class="empty-hint">Add to Pending Jobs above, then go to the Jobs tab to run it.</span></div>`;
     wirePendingToggle('visual');
+    wireVisualRescan();
     wireNdReset();
     return;
   }
@@ -1392,13 +1767,17 @@ function renderVisual() {
   if (!g) return;
   ndStartPending(g);
 
-  const existing = ndDecisions[g.id];
-  let html = `<h2 class="page-title">Visually Similar</h2>${toggle}${resetRow}
+  const groupKeepCount = g.images.filter(im => ndPending[im.path] !== 'discard').length;
+  const groupDiscardCount = g.images.length - groupKeepCount;
+  let html = `<h2 class="page-title">Visually Similar</h2>${toggle}${rescanRow}${resetRow}
     <div id="progress-track"><div class="bar"><div class="bar-fill" style="width:${100*decidedCount/ndGroups.length}%"></div></div>
     <div id="progress-label">${decidedCount} / ${ndGroups.length} decided &mdash; viewing group ${ndIdx+1}</div></div>
-    <div id="groupmeta">Group ${ndIdx+1} of ${ndGroups.length} &middot; avg. hash distance ${g.avg_distance}` +
-    (existing ? existing.skipped ? ' &middot; <b>skipped</b>' : ` &middot; kept <b>${existing.keep.length}</b> / discarded <b>${existing.discard.length}</b>` : '') +
-    `</div><div id="cards-wrap">
+    <div class="nd-stats">
+      <span class="nd-stat"><b>${g.images.length}</b> Images</span>
+      <span class="nd-stat">Image Group <b>${ndIdx+1}</b>/<b>${ndGroups.length}</b></span>
+      <span class="nd-stat">Keeping <b id="nd-keep-count">${groupKeepCount}</b> / Discarding <b id="nd-discard-count">${groupDiscardCount}</b></span>
+    </div>
+    <div id="cards-wrap">
       <button class="carousel-arrow" id="cards-prev" aria-label="Scroll left">&lsaquo;</button>
       <div id="cards">`;
   g.images.forEach((im, i) => {
@@ -1421,25 +1800,35 @@ function renderVisual() {
       <button class="carousel-arrow" id="cards-next" aria-label="Scroll right">&rsaquo;</button>
     </div>
     <footer class="nd-footer">
-      <button class="btn btn-primary" id="nd-confirm">Confirm &amp; next (Enter)</button>
-      <button class="btn" id="nd-skip">Skip (S)</button>
       <button class="btn" id="nd-prev">&larr; prev</button>
-      <button class="btn" id="nd-next">next &rarr;</button>
+      <button class="btn btn-primary" id="nd-next">next &rarr; (Enter)</button>
+      <button class="btn" id="nd-skip">Skip (S)</button>
       <span class="hint">Click an image, or press its number, to toggle keep/discard. More than one can be kept.</span>
     </footer>`;
   panel.innerHTML = html;
   wirePendingToggle('visual');
+  wireVisualRescan();
   wireNdReset();
 
   panel.querySelectorAll('.card').forEach(card => {
-    // suppressed after a click-and-drag carousel scroll (see
-    // wireCardsDrag) so releasing a drag over a card doesn't also toggle it
-    card.addEventListener('click', () => { if (!cardsDragMoved) ndToggle(card.dataset.path); });
+    // For mouse, wireCardsDrag's pointerup handler is what actually
+    // toggles a plain click (see the note there) - this listener mainly
+    // covers touch/pen taps, which never go through that mouse-only
+    // pointer handling at all. Both guard flags are consumed (reset)
+    // immediately on use, suppressing exactly the one click they're
+    // about, rather than left set until the next *mouse* pointerdown -
+    // on a touchscreen device mixing mouse and touch, a stale flag left
+    // over from an earlier mouse drag/click would otherwise go on wrongly
+    // suppressing an unrelated later touch tap indefinitely.
+    card.addEventListener('click', () => {
+      if (cardsJustToggledViaPointer) { cardsJustToggledViaPointer = false; return; }
+      if (cardsDragMoved) { cardsDragMoved = false; return; }
+      ndToggle(card.dataset.path);
+    });
   });
-  document.getElementById('nd-confirm').onclick = ndConfirm;
   document.getElementById('nd-skip').onclick = ndSkip;
-  document.getElementById('nd-prev').onclick = async () => { await ndSaveIfTouched(); ndIdx = Math.max(0, ndIdx - 1); renderVisual(); };
-  document.getElementById('nd-next').onclick = async () => { await ndSaveIfTouched(); ndIdx = Math.min(ndGroups.length - 1, ndIdx + 1); renderVisual(); };
+  document.getElementById('nd-prev').onclick = async () => { await ndSaveCurrent(); ndIdx = Math.max(0, ndIdx - 1); renderVisual(); };
+  document.getElementById('nd-next').onclick = async () => { await ndSaveCurrent(); ndIdx = Math.min(ndGroups.length - 1, ndIdx + 1); renderVisual(); };
   wireCardsCarousel();
 }
 
@@ -1499,12 +1888,18 @@ function wireCardsCarousel() {
 // the .card click handlers above to swallow the click a drag ends on, so
 // releasing a drag over a card never also toggles it.
 let cardsDragMoved = false;
+// set true right after a plain (non-drag) mouse press-release toggles its
+// card directly via pointerup - tells the .card click listener to skip
+// its own toggle if 'click' also fires for that same press, so it can
+// never double-toggle. Reset on the next pointerdown either way.
+let cardsJustToggledViaPointer = false;
 
 function wireCardsDrag(track) {
   const DRAG_THRESHOLD = 6;  // px of movement before a press counts as a drag, not a click
   let dragging = false;
   let startX = 0, startScrollLeft = 0;
   let samples = [];  // trailing {x, t} window, for velocity at release
+  let pressedCard = null;  // the .card actually pressed on, captured at pointerdown - see the note in pointerup below
 
   // Images (and any future draggable descendant) must not start a native
   // HTML5 drag - that's what was actually breaking this: <img> is
@@ -1536,6 +1931,8 @@ function wireCardsDrag(track) {
     track.style.scrollBehavior = 'auto';
     dragging = true;
     cardsDragMoved = false;
+    cardsJustToggledViaPointer = false;
+    pressedCard = e.target.closest('.card');
     startX = e.clientX;
     startScrollLeft = track.scrollLeft;
     samples = [{ x: e.clientX, t: performance.now() }];
@@ -1563,20 +1960,39 @@ function wireCardsDrag(track) {
     e.preventDefault();
   });
 
+  // Returns true if this was a real drag, false if it was a plain
+  // press-and-release (no drag), or undefined if there was nothing to end.
   function endDrag(e) {
-    if (!dragging) return;
+    if (!dragging) return undefined;
     dragging = false;
     track.classList.remove('dragging');
     try { track.releasePointerCapture(e.pointerId); } catch (_) { /* already released */ }
-    if (!cardsDragMoved) { track.style.scrollBehavior = ''; return; }
+    if (!cardsDragMoved) { track.style.scrollBehavior = ''; return false; }
     const first = samples[0], last = samples[samples.length - 1];
     const dt = last.t - first.t;
     let velocity = dt > 0 ? (last.x - first.x) / dt : 0;  // px/ms, same sign convention as dx above
     const MAX_VELOCITY = 3;  // sanity clamp against a noisy single-frame spike
     velocity = Math.max(-MAX_VELOCITY, Math.min(MAX_VELOCITY, velocity));
     startMomentum(track, velocity);
+    return true;
   }
-  track.addEventListener('pointerup', endDrag);
+  track.addEventListener('pointerup', (e) => {
+    const wasDrag = endDrag(e);
+    if (wasDrag === false && pressedCard) {
+      // Toggle directly here rather than relying on the native 'click'
+      // event that would normally follow: once setPointerCapture has been
+      // engaged for a gesture, real browsers don't reliably target the
+      // resulting click at the element actually under the pointer (this
+      // is browser-specific behavior jsdom doesn't reproduce, which is
+      // how the previous fix here looked right but still left clicking
+      // broken). Acting on the pointer sequence itself sidesteps that
+      // entirely. cardsJustToggledViaPointer tells the .card click
+      // listener to skip its own toggle if 'click' does still fire for
+      // this press, so it can never double-toggle.
+      ndToggle(pressedCard.dataset.path);
+      cardsJustToggledViaPointer = true;
+    }
+  });
   track.addEventListener('pointercancel', endDrag);
 }
 
@@ -1624,28 +2040,33 @@ function ndToggle(path) {
   card.classList.toggle('keep', isKeep);
   card.classList.toggle('discard', !isKeep);
   card.querySelector('.state').textContent = isKeep ? 'KEEP' : 'DISCARD';
+  ndUpdateStatsCounts();
   // number-key toggles can target a card scrolled out of the carousel's
   // view - bring it into view so the state change is actually visible.
   // A no-op (no scrolling) if it's already fully in view.
   card.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' });
 }
+// Keeps the "Keeping X / Discarding X" stat live as cards are toggled,
+// without a full renderVisual() re-render (which would rebuild the whole
+// carousel and lose scroll position mid-toggle).
+function ndUpdateStatsCounts() {
+  const g = ndGroups[ndIdx];
+  if (!g) return;
+  const keepEl = document.getElementById('nd-keep-count');
+  const discardEl = document.getElementById('nd-discard-count');
+  if (!keepEl || !discardEl) return;
+  const keepCount = g.images.filter(im => ndPending[im.path] !== 'discard').length;
+  keepEl.textContent = keepCount;
+  discardEl.textContent = g.images.length - keepCount;
+}
 
 async function ndSaveDecision(gid, keep, discard, skipped) {
   ndDecisions[gid] = {keep, discard, skipped, decided_at: new Date().toISOString()};
+  updateJobsBadge();
   await fetch('/api/nd/decide', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({group_id: gid, keep, discard, skip: skipped})
   });
-}
-
-async function ndConfirm() {
-  const g = ndGroups[ndIdx];
-  const keep = g.images.map(im => im.path).filter(p => ndPending[p] !== 'discard');
-  const discard = g.images.map(im => im.path).filter(p => ndPending[p] === 'discard');
-  await ndSaveDecision(g.id, keep, discard, false);
-  ndIdx = ndFirstUndecidedFrom(ndIdx + 1);
-  if (ndIdx === -1) ndIdx = ndGroups.length;
-  renderVisual();
 }
 
 async function ndSkip() {
@@ -1663,14 +2084,13 @@ window.addEventListener('keydown', async (e) => {
   if (document.getElementById('confirm-overlay').classList.contains('open')) return;
   const g = ndGroups[ndIdx];
   if (!g) return;
-  if (e.key === 'Enter') { ndConfirm(); return; }
   if (e.key === 's' || e.key === 'S') { ndSkip(); return; }
-  // Left/Right just browse by default, but if you've toggled anything for
-  // this group without pressing Enter, save it first - same save Enter
-  // would do - so navigating away with the arrow keys doesn't silently
-  // lose those toggles.
-  if (e.key === 'ArrowLeft') { await ndSaveIfTouched(); ndIdx = Math.max(0, ndIdx - 1); renderVisual(); return; }
-  if (e.key === 'ArrowRight') { await ndSaveIfTouched(); ndIdx = Math.min(ndGroups.length - 1, ndIdx + 1); renderVisual(); return; }
+  // Enter and ArrowRight both act like the "next" button (save + advance);
+  // ArrowLeft acts like "prev". All three always save the current
+  // keep/discard split first, same as clicking next/prev - see
+  // ndSaveCurrent().
+  if (e.key === 'Enter' || e.key === 'ArrowRight') { await ndSaveCurrent(); ndIdx = Math.min(ndGroups.length - 1, ndIdx + 1); renderVisual(); return; }
+  if (e.key === 'ArrowLeft') { await ndSaveCurrent(); ndIdx = Math.max(0, ndIdx - 1); renderVisual(); return; }
   const n = parseInt(e.key, 10);
   if (!isNaN(n) && n >= 1 && g.images[n-1]) ndToggle(g.images[n-1].path);
 });
@@ -1678,19 +2098,31 @@ window.addEventListener('keydown', async (e) => {
 // ---------- Identical Files sub-tab (preview only) ----------
 
 let identicalPrefer = 'oldest';
+let identicalData = null;  // cached, used for the Jobs badge without a round-trip
+let identicalSortCol = null;  // null = natural (server) order; 'duplicates' | 'path'
+let identicalSortDir = 'asc';
 
 async function loadIdentical() {
-  const panel = document.getElementById('sub-identical');
-  panel.innerHTML = '<div class="spinner">Scanning&hellip;</div>';
-  const r = await fetch(`/api/identical/preview?prefer=${identicalPrefer}`);
-  const data = await r.json();
-  renderIdentical(data);
+  if (tabLoading.identical) return;  // already in flight (e.g. from startAllTabLoads) - avoid an overlapping duplicate fetch
+  setTabLoading('identical', true, 'Scanning');
+  try {
+    const r = await fetch(`/api/identical/preview?prefer=${identicalPrefer}`);
+    const data = await r.json();
+    identicalData = data;
+    setTabLoading('identical', false);
+    updateJobsBadge();
+    renderIdentical(data);
+  } catch (e) {
+    setTabLoading('identical', false);
+    document.getElementById('sub-identical').innerHTML = loadErrorHtml('Identical Files', e, 'identical-retry');
+    document.getElementById('identical-retry').onclick = loadIdentical;
+  }
 }
 
 function renderIdentical(data) {
   const panel = document.getElementById('sub-identical');
   const toggle = pendingToggleHtml('identical', data.total_files === 0,
-    data.total_files === 0 ? 'Nothing found' : `${plural(data.total_files, 'file')} would be quarantined`);
+    data.total_files === 0 ? 'Nothing found' : `${plural(data.total_files, 'file')} to be added`);
   let html = `<h2 class="page-title">Identical Files</h2>
     <p class="page-sub">Byte-for-byte duplicates, matched by SHA-256 content hash.</p>${toggle}
     <div class="toolbar">
@@ -1712,28 +2144,105 @@ function renderIdentical(data) {
     return;
   }
   html += `<div class="summary">${plural(data.groups.length, 'duplicate group')}, ${plural(data.total_files, 'file')} would be quarantined, reclaiming ${data.total_size_human}.</div>`;
-  html += '<table class="plan"><tr><th>Action</th><th>Path</th><th>Size</th></tr>';
-  data.groups.forEach(g => {
-    html += `<tr><td class="keep-badge">KEEP</td><td>${esc(g.keep)} <span class="dup-count">(${plural(g.move.length, 'duplicate')})</span></td><td>${g.keep_size_human}</td></tr>`;
+
+  const groups = data.groups.slice();
+  if (identicalSortCol) {
+    groups.sort((a, b) => {
+      const cmp = identicalSortCol === 'duplicates'
+        ? a.move.length - b.move.length
+        : a.keep.toLowerCase().localeCompare(b.keep.toLowerCase());
+      return identicalSortDir === 'asc' ? cmp : -cmp;
+    });
+  }
+  const idArrow = col => identicalSortCol === col ? (identicalSortDir === 'asc' ? ' ▲' : ' ▼') : '';
+  html += `<div class="kept-files-header">
+      <span class="sortable dup-header-cell" data-sort="duplicates">Duplicates${idArrow('duplicates')}</span>
+      <span></span>
+      <span class="sortable" data-sort="path">Path${idArrow('path')}</span>
+      <span></span>
+    </div>
+    <div class="kept-files-list">`;
+  groups.forEach((g, i) => {
+    html += `<div class="kept-row-wrap">
+      <div class="kept-row" data-idx="${i}">
+        <span class="dup-count-cell">${g.move.length}</span>
+        ${thumbHtml(g.keep, false)}
+        <div class="info"><div class="path">${esc(g.keep)}</div><div class="meta">${esc(g.keep_size_human)}</div></div>
+        <span class="expand-arrow">&#9656;</span>
+      </div>
+      <div class="dup-detail"><div class="dup-detail-inner">
+        <div class="dup-plain-list">
+          ${g.move.map(m => `<div class="dup-plain-row">
+            ${thumbHtml(m.path, false)}
+            <div class="info"><div class="path">${esc(m.path)}</div><div class="meta">${esc(m.size_human)}</div></div>
+          </div>`).join('')}
+        </div>
+      </div></div>
+    </div>`;
   });
-  html += '</table>';
+  html += '</div>';
   panel.innerHTML = html;
   document.getElementById('identical-prefer').value = identicalPrefer;
   document.getElementById('identical-prefer').onchange = (e) => { identicalPrefer = e.target.value; loadIdentical(); };
   document.getElementById('identical-rescan').onclick = loadIdentical;
   wirePendingToggle('identical');
+
+  panel.querySelectorAll('.kept-row').forEach(row => {
+    row.onclick = () => row.closest('.kept-row-wrap').classList.toggle('expanded');
+  });
+  panel.querySelectorAll('.kept-files-header .sortable').forEach(span => {
+    span.onclick = () => {
+      const col = span.dataset.sort;
+      if (identicalSortCol === col) identicalSortDir = identicalSortDir === 'asc' ? 'desc' : 'asc';
+      else { identicalSortCol = col; identicalSortDir = 'asc'; }
+      renderIdentical(data);
+    };
+  });
 }
 
 // ---------- Normalisation sub-tab (directory merge + lowercase, preview only) ----------
 
 let normaliseRenameConflicts = false;
+let normaliseCaseStyle = 'lower';    // 'none' | 'lower' | 'camel'
+let normaliseSepStyle = 'none';      // 'none' | 'spaces-dash' | 'spaces-underscore' | 'dash-underscore' | 'underscore-dash'
+let normaliseTypeFilter = 'all';     // 'all' | 'file' | 'dir'
+let normaliseSortCol = 'type';       // 'type' | 'current' | 'normalised'
+let normaliseSortDir = 'asc';        // 'asc' | 'desc' - default (type, asc) puts "Directory" above "File" for free, alphabetically
+let normaliseData = null;  // cached, used for the Jobs badge without a round-trip
 
 async function loadNormalise() {
-  const panel = document.getElementById('sub-normalise');
-  panel.innerHTML = '<div class="spinner">Scanning&hellip;</div>';
-  const r = await fetch(`/api/normalise/preview?rename_conflicts=${normaliseRenameConflicts}`);
-  const data = await r.json();
-  renderNormalise(data);
+  if (tabLoading.normalise) return;  // already in flight (e.g. from startAllTabLoads) - avoid an overlapping duplicate fetch
+  setTabLoading('normalise', true, 'Scanning');
+  try {
+    const r = await fetch(`/api/normalise/preview?rename_conflicts=${normaliseRenameConflicts}`
+      + `&case_style=${normaliseCaseStyle}&sep_style=${normaliseSepStyle}`);
+    const data = await r.json();
+    if (data.ok === false) throw new Error(data.error || 'request failed');
+    normaliseData = data;
+    setTabLoading('normalise', false);
+    updateJobsBadge();
+    renderNormalise(data);
+  } catch (e) {
+    setTabLoading('normalise', false);
+    document.getElementById('sub-normalise').innerHTML = loadErrorHtml('Normalisation', e, 'normalise-retry');
+    document.getElementById('normalise-retry').onclick = loadNormalise;
+  }
+}
+
+// What the "Normalised Path" column shows for an action that isn't a
+// straightforward move/rename - there's no "Action" column anymore to
+// spell these out, so the outcome has to read clearly from this cell alone.
+function normalisedPathText(a) {
+  if (a.type === 'conflict') return 'left in place (conflict)';
+  if (a.type === 'quarantine') return 'duplicate → quarantined';
+  if (a.type === 'delete') return 'duplicate → deleted';
+  return a.dest || a.src;  // move / rename
+}
+
+function normaliseSortValue(a, col) {
+  if (col === 'type') return a.is_dir ? 'Directory' : 'File';
+  if (col === 'normalised') return normalisedPathText(a);
+  return a.src;  // 'current'
 }
 
 function renderNormalise(data) {
@@ -1741,39 +2250,235 @@ function renderNormalise(data) {
   const total = data.actions.length;
   const toggle = pendingToggleHtml('normalise', total === 0,
     total === 0 ? 'Nothing to do' : `${plural(total, 'action')} planned`);
+  // A conflict can show up either as an actual "conflict" (left alone) or,
+  // once "rename conflicting file names" is checked, as a "rename" that's
+  // flagged was_conflict - checking both means the warning box (and its
+  // own checkbox) stays visible either way, so it's never possible to
+  // check the box and have it vanish out from under you with no way back.
+  const conflictActions = data.actions.filter(a => a.type === 'conflict' || a.was_conflict);
   let html = `<h2 class="page-title">Normalisation</h2>
-    <p class="page-sub">Merges duplicate-looking sibling directories (e.g. "Foo" + "Foo_1") and lowercases every file/directory name.</p>${toggle}
-    <div class="checkbox-row"><input type="checkbox" id="normalise-rename-conflicts" ${normaliseRenameConflicts ? 'checked' : ''}>
-      <label for="normalise-rename-conflicts">Rename conflicting file names instead of leaving them as unresolved conflicts</label></div>
-    <div class="toolbar"><button class="btn" id="normalise-rescan">Rescan</button></div>`;
+    <p class="page-sub">Merges duplicate-looking sibling directories (e.g. "Foo" + "Foo_1") and renames files/directories to match the styles below.</p>${toggle}
+    <div class="toolbar">
+      <label>Case: <select id="normalise-case-style">
+        <option value="none"${normaliseCaseStyle === 'none' ? ' selected' : ''}>unchanged</option>
+        <option value="lower"${normaliseCaseStyle === 'lower' ? ' selected' : ''}>lowercase</option>
+        <option value="camel"${normaliseCaseStyle === 'camel' ? ' selected' : ''}>camelCase</option>
+      </select></label>
+      <label>Separators: <select id="normalise-sep-style">
+        <option value="none"${normaliseSepStyle === 'none' ? ' selected' : ''}>unchanged</option>
+        <option value="spaces-dash"${normaliseSepStyle === 'spaces-dash' ? ' selected' : ''}>spaces &rarr; dashes</option>
+        <option value="spaces-underscore"${normaliseSepStyle === 'spaces-underscore' ? ' selected' : ''}>spaces &rarr; underscores</option>
+        <option value="dash-underscore"${normaliseSepStyle === 'dash-underscore' ? ' selected' : ''}>dashes &rarr; underscores</option>
+        <option value="underscore-dash"${normaliseSepStyle === 'underscore-dash' ? ' selected' : ''}>underscores &rarr; dashes</option>
+      </select></label>
+      <button class="btn" id="normalise-rescan">Rescan</button>
+    </div>`;
+  if (conflictActions.length > 0) {
+    html += `<div class="warn-box warn-yellow">
+      <b>${plural(conflictActions.length, 'naming conflict')} found</b> - ${conflictActions.length === 1 ? 'a file or directory' : 'some files/directories'} would collide with an existing name after normalising.
+      <label style="display:flex;gap:8px;align-items:center;margin-top:10px">
+        <input type="checkbox" id="normalise-rename-conflicts" ${normaliseRenameConflicts ? 'checked' : ''}>
+        Rename conflicting file names instead of leaving them as unresolved conflicts
+      </label>
+    </div>`;
+  }
   if (data.actions.length === 0) {
-    html += '<div class="empty">Nothing to normalise - no sibling directory duplicates, and everything is already lowercase.</div>';
+    html += '<div class="empty">Nothing to normalise - no sibling directory duplicates, and names already match the selected styles.</div>';
     panel.innerHTML = html;
     wireNormaliseToolbar();
     return;
   }
-  const c = data.counts;
-  html += `<div class="summary">${plural(c.move||0,'file')} to move &middot; ${plural((c.quarantine||0)+(c.delete||0),'file')} to quarantine as duplicates &middot; ${plural(c.rename||0,'file')} renamed &middot; ${plural(c.conflict||0,'conflict')} left alone.</div>`;
-  html += '<table class="plan"><tr><th>Action</th><th>Path</th><th>Size</th></tr>';
-  data.actions.forEach(a => {
-    const label = {move:'move', quarantine:'dup', delete:'delete', rename:'rename', conflict:'CONFLICT'}[a.type] || a.type;
-    let path = esc(a.src);
-    if (a.dest) path += ' &rarr; ' + esc(a.dest);
-    if (a.kept) path += ` (kept: ${esc(a.kept)})`;
-    html += `<tr class="${a.type}"><td>${label}</td><td>${path}</td><td>${human(a.size)}</td></tr>`;
+  html += `<div class="toolbar">
+      <label>Show: <select id="normalise-type-filter">
+        <option value="all"${normaliseTypeFilter === 'all' ? ' selected' : ''}>Files &amp; directories</option>
+        <option value="file"${normaliseTypeFilter === 'file' ? ' selected' : ''}>Files only</option>
+        <option value="dir"${normaliseTypeFilter === 'dir' ? ' selected' : ''}>Directories only</option>
+      </select></label>
+      <span class="spacer-note">${plural(data.counts.rename || 0, 'file')} to Rename</span>
+    </div>`;
+
+  const filtered = data.actions.filter(a =>
+    normaliseTypeFilter === 'all' ? true : normaliseTypeFilter === 'dir' ? a.is_dir : !a.is_dir);
+  const sorted = filtered.slice().sort((a, b) => {
+    const av = normaliseSortValue(a, normaliseSortCol).toLowerCase();
+    const bv = normaliseSortValue(b, normaliseSortCol).toLowerCase();
+    const cmp = av < bv ? -1 : av > bv ? 1 : a.src.localeCompare(b.src);  // tie-break: current path, always ascending
+    return normaliseSortDir === 'asc' ? cmp : -cmp;
+  });
+
+  const arrow = col => normaliseSortCol === col ? (normaliseSortDir === 'asc' ? ' ▲' : ' ▼') : '';
+  html += `<table class="plan"><tr>
+      <th class="sortable" data-sort="type">Type${arrow('type')}</th>
+      <th class="sortable" data-sort="current">Current Path${arrow('current')}</th>
+      <th class="sortable" data-sort="normalised">Normalised Path${arrow('normalised')}</th>
+    </tr>`;
+  if (sorted.length === 0) {
+    html += `<tr><td colspan="3" style="text-align:center;color:var(--text-faint);padding:16px">No ${normaliseTypeFilter === 'dir' ? 'directories' : 'files'} among the planned actions.</td></tr>`;
+  }
+  sorted.forEach(a => {
+    const normalisedCell = (a.type === 'move' || a.type === 'rename')
+      ? esc(normalisedPathText(a))
+      : `<span class="dup-count">${esc(normalisedPathText(a))}</span>`;
+    const conflictResolved = a.type === 'rename' && a.was_conflict;
+    html += `<tr class="${a.type}${conflictResolved ? ' conflict-resolved' : ''}">
+      <td>${a.is_dir ? 'Directory' : 'File'}</td>
+      <td>${esc(a.src)}</td>
+      <td>${normalisedCell}</td>
+    </tr>`;
   });
   html += '</table>';
   panel.innerHTML = html;
   wireNormaliseToolbar();
+
+  panel.querySelectorAll('th.sortable').forEach(th => {
+    th.onclick = () => {
+      const col = th.dataset.sort;
+      if (normaliseSortCol === col) normaliseSortDir = normaliseSortDir === 'asc' ? 'desc' : 'asc';
+      else { normaliseSortCol = col; normaliseSortDir = 'asc'; }
+      renderNormalise(data);
+    };
+  });
+  const filterSel = document.getElementById('normalise-type-filter');
+  if (filterSel) filterSel.onchange = (e) => { normaliseTypeFilter = e.target.value; renderNormalise(data); };
 }
 
 function wireNormaliseToolbar() {
   document.getElementById('normalise-rescan').onclick = loadNormalise;
-  document.getElementById('normalise-rename-conflicts').onchange = (e) => {
-    normaliseRenameConflicts = e.target.checked;
+  const renameConflictsCb = document.getElementById('normalise-rename-conflicts');
+  if (renameConflictsCb) {
+    renameConflictsCb.onchange = (e) => {
+      normaliseRenameConflicts = e.target.checked;
+      loadNormalise();
+    };
+  }
+  document.getElementById('normalise-case-style').onchange = (e) => {
+    normaliseCaseStyle = e.target.value;
+    loadNormalise();
+  };
+  document.getElementById('normalise-sep-style').onchange = (e) => {
+    normaliseSepStyle = e.target.value;
     loadNormalise();
   };
   wirePendingToggle('normalise');
+}
+
+// ---------- Upscale sub-tab ----------
+//
+// Not part of the Pending Jobs staging system the other three Operations
+// tabs share - AI upscaling is additive (writes a new "<name>_upscaled"
+// file alongside the original, never moves/deletes anything), so there's
+// no quarantine/manifest/restore story here at all, and no "keep vs
+// discard" decision to stage. It gets its own self-contained Start
+// button instead, same shape as the Quarantine tab's buttons.
+
+let upscaleData = null;     // raw {images, min_target, max_target, default_target, tool_error} from the last scan
+let upscaleTarget = null;   // current slider value - null until the first load sets it from default_target
+let upscaleSliderDebounce = null;
+const UPSCALE_WARN_THRESHOLD = 15;  // eligible count at/above which the "this'll take a while" box shows
+
+async function loadUpscale() {
+  if (tabLoading.upscale) return;  // already in flight (e.g. from startAllTabLoads) - avoid an overlapping duplicate fetch
+  setTabLoading('upscale', true, 'Scanning');
+  try {
+    const r = await fetch('/api/upscale/preview');
+    const data = await r.json();
+    upscaleData = data;
+    if (upscaleTarget === null) upscaleTarget = data.default_target;
+    setTabLoading('upscale', false);
+    renderUpscale(data);
+  } catch (e) {
+    setTabLoading('upscale', false);
+    document.getElementById('sub-upscale').innerHTML = loadErrorHtml('Upscale', e, 'upscale-retry');
+    document.getElementById('upscale-retry').onclick = loadUpscale;
+  }
+}
+
+function eligibleUpscaleImages(data, target) {
+  return data.images.filter(im => im.longest < target);
+}
+
+// Only the summary/warning/list portion - deliberately never touches the
+// slider or Start button elements themselves, so re-running this on every
+// slider "input" event (i.e. continuously while dragging) can't ever
+// interrupt an in-progress drag by replacing the <input type=range> out
+// from under the browser's own drag handling.
+function updateUpscaleEligibleSection(data, target) {
+  const section = document.getElementById('upscale-eligible-section');
+  if (!section) return;
+  const eligible = eligibleUpscaleImages(data, target);
+  const startBtn = document.getElementById('upscale-start');
+  if (startBtn) startBtn.disabled = !!data.tool_error || eligible.length === 0;
+
+  let html = `<div class="upscale-summary">${plural(eligible.length, 'image')} below ${target}px on their longest side` +
+    (eligible.length ? ' - eligible for upscaling.' : '.') +
+    (data.images.length > eligible.length ? ` (${plural(data.images.length - eligible.length, 'other image')} already meet or exceed this size and ${data.images.length - eligible.length === 1 ? 'is' : 'are'} not shown.)` : '') +
+    `</div>`;
+
+  if (eligible.length >= UPSCALE_WARN_THRESHOLD) {
+    html += `<div class="warn-box warn-yellow"><b>${plural(eligible.length, 'image')} queued</b> - AI upscaling runs one image at a time on the GPU and can take anywhere from several seconds to over a minute per image depending on how much upscaling it needs. With this many eligible, running this could take a long time.</div>`;
+  }
+
+  if (eligible.length === 0) {
+    html += `<div class="empty">${data.images.length === 0 ? 'No images found in this directory.' : `Nothing below ${target}px - every image already meets or exceeds the target.`}</div>`;
+    section.innerHTML = html;
+    return;
+  }
+
+  html += '<div class="thumb-grid">';
+  eligible.forEach(im => {
+    const scale = target / im.longest;
+    const newW = Math.max(1, Math.round(im.width * scale));
+    const newH = Math.max(1, Math.round(im.height * scale));
+    html += `<div class="thumb-row">
+      ${thumbHtml(im.path, false)}
+      <div class="info"><div class="path">${esc(im.path)}</div>
+      <div class="meta">${im.size_human} &middot; ${im.width}&times;${im.height} &rarr; ${newW}&times;${newH}</div></div>
+    </div>`;
+  });
+  html += '</div>';
+  section.innerHTML = html;
+}
+
+function renderUpscale(data) {
+  const panel = document.getElementById('sub-upscale');
+  let html = `<h2 class="page-title">Upscale</h2>
+    <p class="page-sub">AI-upscales images (Real-ESRGAN, GPU) so their longest side reaches the target below, preserving aspect ratio. Images already at or above the target aren't touched or listed. Output is saved as a new "&lt;name&gt;_upscaled" file - originals are never modified or removed.</p>`;
+  if (data.tool_error) {
+    html += `<div class="warn-box">Upscaling isn't available on this machine: ${esc(data.tool_error)}</div>`;
+  }
+  html += `<div class="upscale-slider-row">
+    <label for="upscale-target">Target longest side: <span class="upscale-target-value" id="upscale-target-value">${upscaleTarget}px</span></label>
+    <input type="range" id="upscale-target" min="${data.min_target}" max="${data.max_target}" step="1" value="${upscaleTarget}">
+    <button class="btn" id="upscale-rescan">Rescan</button>
+  </div>
+  <div id="upscale-eligible-section"></div>
+  <div class="toolbar">
+    <button class="btn btn-primary btn-lg" id="upscale-start" ${data.tool_error ? 'disabled' : ''}>Start Upscale</button>
+  </div>`;
+  panel.innerHTML = html;
+  updateUpscaleEligibleSection(data, upscaleTarget);
+
+  document.getElementById('upscale-rescan').onclick = loadUpscale;
+  document.getElementById('upscale-target').oninput = (e) => {
+    upscaleTarget = parseInt(e.target.value, 10);
+    document.getElementById('upscale-target-value').textContent = upscaleTarget + 'px';
+    clearTimeout(upscaleSliderDebounce);
+    upscaleSliderDebounce = setTimeout(() => updateUpscaleEligibleSection(upscaleData, upscaleTarget), 80);
+  };
+  document.getElementById('upscale-start').onclick = async () => {
+    const eligible = eligibleUpscaleImages(upscaleData, upscaleTarget);
+    confirmAction('Start upscaling',
+      `<p>${plural(eligible.length, 'image')} below ${upscaleTarget}px will be upscaled to that size on their longest side. This runs on the GPU and can take a while - the page will show progress as it goes.</p>`,
+      async () => {
+        const result = await runJob('Upscaling images&hellip;', '/api/upscale/run', {target: upscaleTarget});
+        if (result === null) return;
+        let msg = `Upscaled ${plural(result.processed, 'image')}.`;
+        if (result.errors.length) msg += ` ${plural(result.errors.length, 'image')} failed - see the server console for details.`;
+        alert(msg);
+        loadUpscale();
+      },
+      {confirmLabel: 'Start'});
+  };
 }
 
 // ---------- Jobs tab (Pending Jobs) ----------
@@ -1792,7 +2497,8 @@ async function loadJobs() {
   }
   panel.innerHTML = `<h2 class="page-title">Pending Jobs</h2><div class="spinner">Building summary&hellip;</div>`;
   const result = await silentBuild(activeOps,
-    {prefer: identicalPrefer, rename_conflicts: normaliseRenameConflicts, delete_duplicates: skipQuarantine});
+    {prefer: identicalPrefer, rename_conflicts: normaliseRenameConflicts, delete_duplicates: skipQuarantine,
+     case_style: normaliseCaseStyle, sep_style: normaliseSepStyle});
   if (activeTab !== 'jobs') return;  // user navigated away while this was loading
   if (result === null) {
     panel.innerHTML = `<h2 class="page-title">Pending Jobs</h2><div class="empty">Could not build the summary - try again.</div>`;
@@ -1840,9 +2546,7 @@ function renderJobsSummary(data) {
   </div>`;
   html += '<div class="thumb-grid">';
   data.items.forEach(it => {
-    const thumb = isImageExt(it.path)
-      ? `<img class="thumb" src="/img/${encodeURIComponent(it.path)}" loading="lazy">`
-      : `<div class="thumb placeholder">file</div>`;
+    const thumb = thumbHtml(it.path, it.is_dir);
     let meta = human(it.size);
     if (it.dest) meta += ` &rarr; ${esc(it.dest)}`;
     if (it.kept) meta += ` (kept: ${esc(it.kept)})`;
@@ -1862,7 +2566,7 @@ function renderJobsSummary(data) {
 
 function wireJobsControls(data) {
   document.querySelectorAll('[data-cancel-op]').forEach(btn => {
-    btn.onclick = () => { pendingOps[btn.dataset.cancelOp] = false; loadJobs(); };
+    btn.onclick = () => { pendingOps[btn.dataset.cancelOp] = false; updateJobsBadge(); loadJobs(); };
   });
   const sq = document.getElementById('skip-quarantine');
   if (sq) sq.onchange = (e) => { skipQuarantine = e.target.checked; loadJobs(); };
@@ -1890,12 +2594,24 @@ function onStart() {
   }
   confirmAction('Start pending jobs', body, async () => {
     const result = await runJob('Running operations', '/api/review/run',
-      {ops: data.ops, prefer: identicalPrefer, rename_conflicts: normaliseRenameConflicts, delete_duplicates: skipQuarantine});
+      {ops: data.ops, prefer: identicalPrefer, rename_conflicts: normaliseRenameConflicts, delete_duplicates: skipQuarantine,
+       case_style: normaliseCaseStyle, sep_style: normaliseSepStyle});
     if (result === null) return;
     showRunResult(result);
     pendingOps = {identical: false, normalise: false, visual: false};
     skipQuarantine = false;
     lastBuiltReview = null;
+    updateJobsBadge();
+    refreshQuarantineBadge();
+    // Identical Files / Normalisation cache would otherwise show a
+    // pre-run plan (files that no longer exist, e.g.) - refresh both now
+    // that the tree has actually changed. Visually Similar isn't touched
+    // here: it has its own in-progress review state tied to a specific
+    // scan, which a silent reset would disrupt.
+    identicalData = null;
+    normaliseData = null;
+    loadIdentical();
+    loadNormalise();
     loadJobs();
   }, {confirmLabel, requireCheckbox});
 }
@@ -1922,9 +2638,13 @@ function showRunResult(result) {
 
 async function loadQuarantine() {
   const panel = document.getElementById('tab-quarantine');
-  panel.innerHTML = '<div class="spinner">Checking&hellip;</div>';
-  const r = await fetch('/api/quarantine/status');
-  const data = await r.json();
+  panel.innerHTML = bigSpinnerHtml('Checking');
+  const data = await refreshQuarantineBadge();  // one fetch drives both the badge and the panel
+  if (data === null) {
+    panel.innerHTML = loadErrorHtml('Quarantine', new Error('could not reach the server'), 'quarantine-retry');
+    document.getElementById('quarantine-retry').onclick = loadQuarantine;
+    return;
+  }
   renderQuarantine(data);
 }
 
@@ -1940,15 +2660,67 @@ function renderQuarantine(data) {
     <div class="big">${plural(data.file_count, 'file')} quarantined, ${data.total_size_human}</div>
     <div class="summary" style="margin:0">Location: <code>${esc(data.path)}</code></div>
   </div>`;
-  html += `<div class="warn-box">Deleting the quarantine folder is <b>permanent</b> - it cannot be undone, and <code>dedupe_images.py --restore</code> will no longer be able to bring ${data.file_count === 1 ? 'this file' : 'these files'} back. Only do this once you've confirmed everything looks right.</div>`;
-  html += `<div class="toolbar"><button class="btn btn-danger" id="qt-delete">Delete quarantine folder permanently&hellip;</button></div>`;
+  html += `<div class="warn-box">Deleting the quarantine folder is <b>permanent</b> - it cannot be undone, and restoring will no longer be able to bring ${data.file_count === 1 ? 'this file' : 'these files'} back. Only do this once you've confirmed everything looks right.</div>`;
+  const restorableCount = (data.files || []).filter(f => f.original_path).length;
+  html += `<div class="toolbar">
+    <button class="btn" id="qt-restore-all" ${restorableCount === 0 ? 'disabled' : ''}>Restore all&hellip;</button>
+    <button class="btn btn-danger" id="qt-delete">Delete quarantine folder permanently&hellip;</button>
+  </div>`;
+  html += '<div class="thumb-grid">';
+  (data.files || []).forEach(f => {
+    const thumb = thumbHtml(f.path, false);
+    // Original path (where it lived before quarantine) is the label a
+    // user will actually recognize - fall back to the in-quarantine path
+    // only when there's no manifest record to say what it used to be.
+    const label = f.original_path || f.path;
+    const metaParts = [f.size_human];
+    if (f.moved_at) metaParts.push(`quarantined ${formatWhen(f.moved_at)}`);
+    if (f.kept_path) metaParts.push(`kept instead: ${esc([].concat(f.kept_path).join(', '))}`);
+    if (!f.original_path) metaParts.push('no manifest record for this file');
+    // Only a file with a manifest record has a known original_path to
+    // restore to - without one there's nowhere to put it back.
+    const restoreBtn = f.original_path
+      ? `<button class="btn btn-sm qt-restore-one" data-path="${esc(f.path)}">Restore</button>`
+      : '';
+    html += `<div class="thumb-row">
+      ${thumb}
+      <div class="info"><div class="path">${esc(label)}</div><div class="meta">${metaParts.join(' &middot; ')}</div></div>
+      ${restoreBtn}
+    </div>`;
+  });
+  html += '</div>';
   panel.innerHTML = html;
+
+  async function doRestore(paths) {
+    const r = await fetch('/api/quarantine/restore', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(paths === null ? {} : {paths}),
+    });
+    const result = await r.json();
+    if (!result.ok) { alert(result.error || 'restore failed'); return; }
+    let msg = `Restored ${plural(result.restored.length, 'file')}.`;
+    if (result.conflicts.length) msg += ` ${plural(result.conflicts.length, 'file')} skipped - something already exists at the original location.`;
+    if (result.missing.length) msg += ` ${plural(result.missing.length, 'file')} skipped - no longer found in quarantine.`;
+    alert(msg);
+    loadQuarantine();
+  }
+
+  panel.querySelectorAll('.qt-restore-one').forEach(btn => {
+    btn.onclick = () => doRestore([btn.dataset.path]);
+  });
+
+  document.getElementById('qt-restore-all').onclick = () => {
+    confirmAction('Restore all quarantined files',
+      `<p>${plural(restorableCount, 'file')} will be moved back to where they originally were.</p>`,
+      () => doRestore(null),
+      {confirmLabel: 'Restore all'});
+  };
 
   document.getElementById('qt-delete').onclick = () => {
     const fileWord = data.file_count === 1 ? 'the file' : 'everything';
     confirmAction('Permanently delete quarantine folder',
       `<div class="warn-box">This will permanently delete ${plural(data.file_count, 'file')} (${data.total_size_human}) with no way to undo it. ` +
-      `<code>dedupe_images.py --restore</code> will stop working for ${fileWord} currently in quarantine.</div>` +
+      `Restoring will stop working for ${fileWord} currently in quarantine.</div>` +
       `<label style="display:flex;gap:8px;align-items:center;margin-top:10px"><input type="checkbox" id="qt-confirm-check"> I understand this cannot be undone.</label>`,
       async () => {
         const r = await fetch('/api/quarantine/delete', {method: 'POST'});
@@ -1995,9 +2767,13 @@ function spawnKoboldWords() {
 
 (async () => {
   spawnKoboldWords();
-  // picks up a scan already in progress - e.g. review_gui.py was launched
-  // with a root argument, or this tab was reloaded mid-scan
-  pollScan();
+  // picks up a directory already chosen (or a scan already in progress) -
+  // e.g. review_gui.py was launched with a root argument, or this tab was
+  // reloaded mid-scan. A plain page reload wipes all client-side JS state
+  // even though the server-side root/scan didn't change, so this needs to
+  // (re)kick off all three tabs' loads same as a fresh "Use this directory".
+  const s = await refreshRootLabel();
+  if (s.root) startAllTabLoads();
   await reloadActive();
   if (!currentRoot) openPicker();
 })();
@@ -2006,14 +2782,16 @@ function spawnKoboldWords() {
 """
 
 
-def _normalise_preview_json(root: Path, rename_conflicts: bool) -> dict:
+def _normalise_preview_json(root: Path, rename_conflicts: bool, case_style: str = "lower",
+                             sep_style: str = "none") -> dict:
     quarantine_dir = root / QUARANTINE_DIRNAME
     dm_actions = plan_and_maybe_execute_dir_merge(root, quarantine_dir, False, [],
                                                     rename_conflicts=rename_conflicts)
     for a in dm_actions:
         a.pop("merge", None)
-    lc_stats = plan_and_maybe_execute_lowercase(root, quarantine_dir, False, [],
-                                                 rename_conflicts=rename_conflicts)
+    lc_stats = plan_and_maybe_execute_normalize(root, quarantine_dir, False, [],
+                                                 rename_conflicts=rename_conflicts,
+                                                 case_style=case_style, sep_style=sep_style)
     actions = dm_actions + lc_stats["actions"]
     enrich_actions(root, actions)
     counts = {}
@@ -2142,7 +2920,34 @@ def make_handler(state: State):
                     return
                 qs = parse_qs(parsed.query)
                 rename_conflicts = qs.get("rename_conflicts", ["false"])[0] == "true"
-                self._json(_normalise_preview_json(root, rename_conflicts))
+                case_style = qs.get("case_style", ["lower"])[0]
+                sep_style = qs.get("sep_style", ["none"])[0]
+                if case_style not in CASE_STYLES or sep_style not in SEPARATOR_STYLES:
+                    self._json({"ok": False, "error": "invalid case_style/sep_style"}, status=400)
+                    return
+                self._json(_normalise_preview_json(root, rename_conflicts, case_style, sep_style))
+                return
+
+            if parsed.path == "/api/upscale/preview":
+                root = self._require_root()
+                if root is None:
+                    return
+                # Unfiltered by target size - the web UI filters/re-renders
+                # client-side as the resolution slider moves, rather than
+                # re-scanning the whole tree on every tick.
+                quarantine_dir = root / QUARANTINE_DIRNAME
+                review_dir = root / REVIEW_DIRNAME
+                images = []
+                for p, w, h in upscale.iter_upscale_candidates(root, quarantine_dir, review_dir):
+                    size = p.stat().st_size
+                    images.append({
+                        "path": str(p.relative_to(root)), "width": w, "height": h,
+                        "longest": max(w, h), "size": size, "size_human": human(size),
+                    })
+                self._json({
+                    "images": images, "min_target": upscale.MIN_TARGET, "max_target": upscale.MAX_TARGET,
+                    "default_target": upscale.DEFAULT_TARGET, "tool_error": upscale.tool_status(),
+                })
                 return
 
             if parsed.path == "/api/quarantine/status":
@@ -2151,21 +2956,42 @@ def make_handler(state: State):
                     return
                 quarantine_dir = root / QUARANTINE_DIRNAME
                 if not quarantine_dir.exists():
-                    self._json({"exists": False, "file_count": 0, "total_size_human": "0.0B"})
+                    self._json({"exists": False, "file_count": 0, "total_size_human": "0.0B", "files": []})
                     return
-                count = 0
+                # Only "quarantine"-type entries ever land under
+                # quarantine_dir (a "deleted" entry was removed outright,
+                # never moved; "rename"/"merge" entries stay under root
+                # proper) - keyed by new_path (root-relative) so each file
+                # actually still sitting in quarantine_dir can be matched
+                # back to its manifest record.
+                manifest = load_manifest(quarantine_dir / MANIFEST_NAME)
+                by_new_path = {e["new_path"]: e for e in manifest
+                               if e.get("type") == "quarantine" and e.get("new_path")}
+                files = []
                 total = 0
                 for dirpath, dirnames, filenames in os.walk(quarantine_dir):
                     for fn in filenames:
                         if fn == MANIFEST_NAME:
                             continue
+                        fpath = Path(dirpath) / fn
                         try:
-                            total += (Path(dirpath) / fn).stat().st_size
+                            size = fpath.stat().st_size
                         except OSError:
                             continue
-                        count += 1
-                self._json({"exists": True, "file_count": count, "total_size_human": human(total),
-                             "path": str(quarantine_dir)})
+                        total += size
+                        rel = str(fpath.relative_to(root))
+                        entry = by_new_path.get(rel)
+                        files.append({
+                            "path": rel, "size": size, "size_human": human(size),
+                            "original_path": entry["original_path"] if entry else None,
+                            "kept_path": entry["kept_path"] if entry else None,
+                            "moved_at": entry["moved_at"] if entry else None,
+                        })
+                # newest-quarantined first - entries with no manifest match
+                # (moved_at is None) sort last rather than first
+                files.sort(key=lambda f: f["moved_at"] or "", reverse=True)
+                self._json({"exists": True, "file_count": len(files), "total_size_human": human(total),
+                             "path": str(quarantine_dir), "files": files})
                 return
 
             if parsed.path.startswith("/img/"):
@@ -2179,8 +3005,19 @@ def make_handler(state: State):
                 if not fpath.is_relative_to(root) or not fpath.is_file():
                     self.send_error(404, "not found")
                     return
-                ctype = mimetypes.guess_type(fpath.name)[0] or "application/octet-stream"
-                data = fpath.read_bytes()
+                if fpath.suffix.lower() in (".tif", ".tiff"):
+                    # No browser renders TIFF in an <img> tag - transcode to
+                    # PNG on the fly so it actually displays instead of a
+                    # broken-image icon. RGBA is a safe universal target
+                    # (handles CMYK/grayscale/palette source modes too).
+                    with Image.open(fpath) as img:
+                        buf = io.BytesIO()
+                        img.convert("RGBA").save(buf, format="PNG")
+                    data = buf.getvalue()
+                    ctype = "image/png"
+                else:
+                    ctype = mimetypes.guess_type(fpath.name)[0] or "application/octet-stream"
+                    data = fpath.read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(data)))
@@ -2240,6 +3077,22 @@ def make_handler(state: State):
                 self._json({"ok": True})
                 return
 
+            if path == "/api/nd/rescan":
+                root = self._require_root()
+                if root is None:
+                    return
+                # Same background scan used at startup/set-root - re-walks
+                # the tree from scratch (picking up anything quarantined,
+                # deleted, or newly added since the last scan) and restores
+                # decisions for any group that's rediscovered unchanged, via
+                # State.scan's own decisions.json snapshot/restore logic.
+                started = start_scan(state, root)
+                if not started:
+                    self._json({"ok": False, "error": "a scan is already running"}, status=409)
+                    return
+                self._json({"ok": True, "started": True})
+                return
+
             if path == "/api/review/build":
                 root = self._require_root()
                 if root is None:
@@ -2248,13 +3101,19 @@ def make_handler(state: State):
                 prefer = body.get("prefer", "oldest")
                 rename_conflicts = bool(body.get("rename_conflicts"))
                 delete_duplicates = bool(body.get("delete_duplicates"))
+                case_style = body.get("case_style", "lower")
+                sep_style = body.get("sep_style", "none")
                 if not ops:
                     self._json({"ok": False, "error": "no operations selected"}, status=400)
+                    return
+                if case_style not in CASE_STYLES or sep_style not in SEPARATOR_STYLES:
+                    self._json({"ok": False, "error": "invalid case_style/sep_style"}, status=400)
                     return
                 phase_count = sum(2 if o == "normalise" else 1 for o in ops) or 1
                 started = start_job("build", phase_count,
                                      lambda prog: do_build_review(root, ops, prefer, rename_conflicts,
-                                                                   delete_duplicates, state, prog))
+                                                                   delete_duplicates, state, prog,
+                                                                   case_style, sep_style))
                 if not started:
                     self._json({"ok": False, "error": "a job is already running"}, status=409)
                     return
@@ -2269,13 +3128,54 @@ def make_handler(state: State):
                 prefer = body.get("prefer", "oldest")
                 rename_conflicts = bool(body.get("rename_conflicts"))
                 delete_duplicates = bool(body.get("delete_duplicates"))
+                case_style = body.get("case_style", "lower")
+                sep_style = body.get("sep_style", "none")
                 if not ops:
                     self._json({"ok": False, "error": "no operations selected"}, status=400)
+                    return
+                if case_style not in CASE_STYLES or sep_style not in SEPARATOR_STYLES:
+                    self._json({"ok": False, "error": "invalid case_style/sep_style"}, status=400)
                     return
                 phase_count = sum(2 if o == "normalise" else 1 for o in ops) + 1
                 started = start_job("run", phase_count,
                                      lambda prog: do_run(root, ops, prefer, rename_conflicts,
-                                                          delete_duplicates, state, prog))
+                                                          delete_duplicates, state, prog,
+                                                          case_style, sep_style))
+                if not started:
+                    self._json({"ok": False, "error": "a job is already running"}, status=409)
+                    return
+                self._json({"ok": True, "started": True})
+                return
+
+            if path == "/api/upscale/run":
+                root = self._require_root()
+                if root is None:
+                    return
+                tool_error = upscale.tool_status()
+                if tool_error:
+                    self._json({"ok": False, "error": tool_error}, status=400)
+                    return
+                try:
+                    target = int(body.get("target"))
+                except (TypeError, ValueError):
+                    self._json({"ok": False, "error": "invalid target resolution"}, status=400)
+                    return
+                if not (upscale.MIN_TARGET <= target <= upscale.MAX_TARGET):
+                    self._json({"ok": False, "error": f"target must be between {upscale.MIN_TARGET} and {upscale.MAX_TARGET}"}, status=400)
+                    return
+
+                def work(prog):
+                    quarantine_dir = root / QUARANTINE_DIRNAME
+                    review_dir = root / REVIEW_DIRNAME
+                    # Fresh recompute of the eligible list at execute time
+                    # (same reasoning as Identical Files/Normalisation's
+                    # Start) - the tree can change between when the list was
+                    # last shown and when Start is actually clicked.
+                    def cb(rel, i, total):
+                        prog.phase_tick(0, f"Upscaling: {rel}", i, total)
+                    return upscale.run_upscale(root, quarantine_dir, review_dir, target, on_progress=cb)
+
+                started = start_job("upscale", 1, work)
                 if not started:
                     self._json({"ok": False, "error": "a job is already running"}, status=409)
                     return
@@ -2299,6 +3199,26 @@ def make_handler(state: State):
                     self._json({"ok": False, "error": str(e)})
                     return
                 self._json({"ok": True, "removed_files": count})
+                return
+
+            if path == "/api/quarantine/restore":
+                root = self._require_root()
+                if root is None:
+                    return
+                quarantine_dir = root / QUARANTINE_DIRNAME
+                # "paths" omitted (key absent) restores everything restorable;
+                # an explicit list (possibly empty) restores just those
+                # entries - matches new_path as returned by
+                # /api/quarantine/status's "path" field for each file.
+                paths = body.get("paths")
+                only = set(paths) if paths is not None else None
+                result = restore_manifest_entries(root, quarantine_dir, only_new_paths=only)
+                self._json({
+                    "ok": True,
+                    "restored": result["restored"],
+                    "missing": [m["original_path"] for m in result["missing"]],
+                    "conflicts": [c["original_path"] for c in result["conflicts"]],
+                })
                 return
 
             self.send_error(404)
@@ -2325,7 +3245,7 @@ def main():
     state = State(args.threshold, extensions)
 
     handler = make_handler(state)
-    server = QuietHTTPServer(("127.0.0.1", args.port), handler)
+    server = QuietHTTPServer(("0.0.0.0", args.port), handler)
     url = f"http://127.0.0.1:{args.port}/"
     print(f"Serving at {url} (Ctrl-C to stop)")
 

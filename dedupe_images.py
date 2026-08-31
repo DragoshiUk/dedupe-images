@@ -117,18 +117,21 @@ def now_iso() -> str:
 
 
 def resolve_conflict(src: Path, dest: Path, root: Path, execute: bool, manifest: list,
-                      rename_conflicts: bool) -> dict:
+                      rename_conflicts: bool, is_dir: bool = False) -> dict:
     """A collision was found at dest that isn't a verified-identical
     duplicate of src (differing content, or a file/directory type
     mismatch). Default: leave both alone, report a conflict. With
     rename_conflicts=True: rename src to a unique __dupN-suffixed sibling
     of dest instead, so both survive under distinct names rather than
-    needing manual intervention."""
+    needing manual intervention. is_dir is carried through into the
+    returned action dict only (for callers that need to tell files and
+    directories apart), it never changes this function's own behavior."""
     rel = src.relative_to(root)
     if not rename_conflicts:
         print(f"  CONFLICT  {rel}  vs  {dest.relative_to(root)}  "
               "(different content - left in place, review manually)")
-        return {"type": "conflict", "src": str(rel), "dest": str(dest.relative_to(root)), "kept": None}
+        return {"type": "conflict", "src": str(rel), "dest": str(dest.relative_to(root)),
+                "kept": None, "is_dir": is_dir, "was_conflict": True}
     new_dest = unique_path(dest)
     print(f"  rename(conflict)  {rel}  ->  {new_dest.relative_to(root)}  "
           "(name collision with different content - kept separately)")
@@ -140,7 +143,12 @@ def resolve_conflict(src: Path, dest: Path, root: Path, execute: bool, manifest:
             "original_path": str(rel), "new_path": str(new_dest.relative_to(root)),
             "kept_path": None, "moved_at": now_iso(),
         })
-    return {"type": "rename", "src": str(rel), "dest": str(new_dest.relative_to(root)), "kept": None}
+    # was_conflict distinguishes this from an ordinary case/separator-style
+    # rename (same "type": "rename" shape otherwise) - callers use it to
+    # flag "this one only exists because rename_conflicts resolved a
+    # naming collision", not a normal normalization rename.
+    return {"type": "rename", "src": str(rel), "dest": str(new_dest.relative_to(root)),
+            "kept": None, "is_dir": is_dir, "was_conflict": True}
 
 
 def normalize_manifest(manifest: list) -> list:
@@ -376,7 +384,7 @@ def merge_loser_into_keeper(root: Path, quarantine_dir: Path, keeper_dir: Path, 
                         "moved_at": now_iso(),
                     })
                 actions.append({"type": "move", "src": str(src.relative_to(root)),
-                                 "dest": str(dest.relative_to(root)), "kept": None})
+                                 "dest": str(dest.relative_to(root)), "kept": None, "is_dir": False})
                 continue
 
             try:
@@ -397,7 +405,7 @@ def merge_loser_into_keeper(root: Path, quarantine_dir: Path, keeper_dir: Path, 
                             "original_path": str(rel), "new_path": None,
                             "kept_path": kept_rel, "moved_at": now_iso(),
                         })
-                    actions.append({"type": "delete", "src": str(rel), "dest": None, "kept": kept_rel})
+                    actions.append({"type": "delete", "src": str(rel), "dest": None, "kept": kept_rel, "is_dir": False})
                 else:
                     qdest = unique_path(quarantine_dir / rel)
                     print(f"  dup(quarantine)  {rel}  (identical to {kept_rel})")
@@ -410,7 +418,7 @@ def merge_loser_into_keeper(root: Path, quarantine_dir: Path, keeper_dir: Path, 
                             "kept_path": kept_rel, "moved_at": now_iso(),
                         })
                     actions.append({"type": "quarantine", "src": str(rel),
-                                     "dest": str(qdest.relative_to(root)), "kept": kept_rel})
+                                     "dest": str(qdest.relative_to(root)), "kept": kept_rel, "is_dir": False})
             else:
                 actions.append(resolve_conflict(src, dest, root, execute, manifest, rename_conflicts))
 
@@ -455,26 +463,78 @@ def plan_and_maybe_execute_dir_merge(root: Path, quarantine_dir: Path, execute: 
 
 
 # ---------------------------------------------------------------------------
-# Lowercase-normalization pass
+# Name-normalization pass (case style + separator style)
 # ---------------------------------------------------------------------------
+
+CASE_STYLES = {"none", "lower", "camel"}
+SEPARATOR_STYLES = {"none", "spaces-dash", "spaces-underscore", "dash-underscore", "underscore-dash"}
+
+
+def to_camel_case(stem: str) -> str:
+    """Splits on any run of non-alphanumeric characters (spaces, dashes,
+    underscores, ...) - so this already treats any separator style as a
+    word boundary regardless of what (if anything) ran before it - lowercases
+    the first word entirely, capitalizes just the first letter of each word
+    after that, and joins with no separator: "My File-Name_v2" -> "myFileNameV2"."""
+    words = [w for w in re.split(r"[^0-9a-zA-Z]+", stem) if w]
+    if not words:
+        return stem
+    first, *rest = words
+    return first.lower() + "".join(w[:1].upper() + w[1:].lower() for w in rest)
+
+
+def transform_name(name: str, case_style: str = "lower", sep_style: str = "none") -> str:
+    """Applies the chosen separator style then case style to a file/directory
+    name (extension included, except camelCase - see below). "none" for
+    either leaves that axis untouched; both "none" is a no-op. Defaults
+    match this script's original lowercase-only behavior, so existing
+    callers that don't pass these get identical results."""
+    if case_style not in CASE_STYLES:
+        raise ValueError(f"unknown case_style: {case_style!r}")
+    if sep_style not in SEPARATOR_STYLES:
+        raise ValueError(f"unknown sep_style: {sep_style!r}")
+
+    result = name
+    if sep_style == "spaces-dash":
+        result = re.sub(r"\s+", "-", result)
+    elif sep_style == "spaces-underscore":
+        result = re.sub(r"\s+", "_", result)
+    elif sep_style == "dash-underscore":
+        result = result.replace("-", "_")
+    elif sep_style == "underscore-dash":
+        result = result.replace("_", "-")
+
+    if case_style == "lower":
+        result = result.lower()
+    elif case_style == "camel":
+        # camelCase only makes sense applied to the stem - an extension
+        # like ".JPG" doesn't have "words" to camel-case, so it's just
+        # lowercased for consistency instead.
+        stem, ext = os.path.splitext(result)
+        result = to_camel_case(stem) + ext.lower()
+
+    return result
+
 
 def rename_case(path: Path, root: Path, quarantine_dir: Path, execute: bool,
                  manifest: list, is_dir: bool, stats: dict,
-                 delete_duplicates: bool = False, rename_conflicts: bool = False):
-    """Lowercase path's own name (not recursive). On a collision, never
-    overwrites: identical-content files are quarantined (or, with
-    delete_duplicates=True, permanently deleted); differing-content
-    files/dirs are left alone and reported as a conflict (or, with
-    rename_conflicts=True, renamed to a unique name so both survive); a
-    directory colliding with an existing lowercase directory is merged
-    into it via merge_loser_into_keeper. Returns the final Path to keep
-    using (which may be unchanged), or None if the entry itself no longer
-    exists (quarantined, deleted, or fully merged away)."""
+                 delete_duplicates: bool = False, rename_conflicts: bool = False,
+                 case_style: str = "lower", sep_style: str = "none"):
+    """Applies transform_name(case_style, sep_style) to path's own name
+    (not recursive). On a collision, never overwrites: identical-content
+    files are quarantined (or, with delete_duplicates=True, permanently
+    deleted); differing-content files/dirs are left alone and reported as
+    a conflict (or, with rename_conflicts=True, renamed to a unique name
+    so both survive); a directory colliding with an existing
+    already-normalized directory is merged into it via
+    merge_loser_into_keeper. Returns the final Path to keep using (which
+    may be unchanged), or None if the entry itself no longer exists
+    (quarantined, deleted, or fully merged away)."""
     name = path.name
-    lower = name.lower()
-    if lower == name:
+    normalized = transform_name(name, case_style, sep_style)
+    if normalized == name:
         return path
-    dest = path.parent / lower
+    dest = path.parent / normalized
 
     if not dest.exists():
         print(f"  rename  {path.relative_to(root)}  ->  {dest.relative_to(root)}")
@@ -490,7 +550,7 @@ def rename_case(path: Path, root: Path, quarantine_dir: Path, execute: bool,
             })
         stats["renamed_dirs" if is_dir else "renamed_files"] += 1
         stats["actions"].append({"type": "rename", "src": str(path.relative_to(root)),
-                                  "dest": str(dest.relative_to(root)), "kept": None})
+                                  "dest": str(dest.relative_to(root)), "kept": None, "is_dir": is_dir})
         # in dry-run mode dest doesn't actually exist yet - recurse into the
         # real (still original-case) path so nested renames aren't silently
         # missed; only in execute mode does dest now exist to recurse into
@@ -498,7 +558,7 @@ def rename_case(path: Path, root: Path, quarantine_dir: Path, execute: bool,
 
     if is_dir:
         if not dest.is_dir():
-            action = resolve_conflict(path, dest, root, execute, manifest, rename_conflicts)
+            action = resolve_conflict(path, dest, root, execute, manifest, rename_conflicts, is_dir=True)
             stats["actions"].append(action)
             if action["type"] == "conflict":
                 stats["conflicts"].append((path, dest))
@@ -549,7 +609,7 @@ def rename_case(path: Path, root: Path, quarantine_dir: Path, execute: bool,
                     "original_path": str(rel), "new_path": None,
                     "kept_path": kept_rel, "moved_at": now_iso(),
                 })
-            stats["actions"].append({"type": "delete", "src": str(rel), "dest": None, "kept": kept_rel})
+            stats["actions"].append({"type": "delete", "src": str(rel), "dest": None, "kept": kept_rel, "is_dir": False})
         else:
             qdest = unique_path(quarantine_dir / rel)
             print(f"  case-dup(quarantine)  {rel}  (identical to {kept_rel})")
@@ -562,7 +622,7 @@ def rename_case(path: Path, root: Path, quarantine_dir: Path, execute: bool,
                     "kept_path": kept_rel, "moved_at": now_iso(),
                 })
             stats["actions"].append({"type": "quarantine", "src": str(rel),
-                                      "dest": str(qdest.relative_to(root)), "kept": kept_rel})
+                                      "dest": str(qdest.relative_to(root)), "kept": kept_rel, "is_dir": False})
         stats["quarantined"] += 1
         return None
 
@@ -575,9 +635,10 @@ def rename_case(path: Path, root: Path, quarantine_dir: Path, execute: bool,
     return path
 
 
-def lowercase_tree(dir_path: Path, root: Path, quarantine_dir: Path, execute: bool,
+def normalize_tree(dir_path: Path, root: Path, quarantine_dir: Path, execute: bool,
                     manifest: list, stats: dict, delete_duplicates: bool = False,
-                    rename_conflicts: bool = False):
+                    rename_conflicts: bool = False, case_style: str = "lower",
+                    sep_style: str = "none"):
     if dir_path.resolve() == quarantine_dir.resolve():
         return
     try:
@@ -594,30 +655,35 @@ def lowercase_tree(dir_path: Path, root: Path, quarantine_dir: Path, execute: bo
         path = dir_path / name
         if path.exists():
             rename_case(path, root, quarantine_dir, execute, manifest, is_dir=False, stats=stats,
-                        delete_duplicates=delete_duplicates, rename_conflicts=rename_conflicts)
+                        delete_duplicates=delete_duplicates, rename_conflicts=rename_conflicts,
+                        case_style=case_style, sep_style=sep_style)
 
     for name in sorted(e.name for e in entries if e.is_dir(follow_symlinks=False)):
         path = dir_path / name
         if not path.exists():
             continue
         final = rename_case(path, root, quarantine_dir, execute, manifest, is_dir=True, stats=stats,
-                             delete_duplicates=delete_duplicates, rename_conflicts=rename_conflicts)
+                             delete_duplicates=delete_duplicates, rename_conflicts=rename_conflicts,
+                             case_style=case_style, sep_style=sep_style)
         if final is not None:
-            lowercase_tree(final, root, quarantine_dir, execute, manifest, stats,
-                            delete_duplicates=delete_duplicates, rename_conflicts=rename_conflicts)
+            normalize_tree(final, root, quarantine_dir, execute, manifest, stats,
+                            delete_duplicates=delete_duplicates, rename_conflicts=rename_conflicts,
+                            case_style=case_style, sep_style=sep_style)
 
 
-def plan_and_maybe_execute_lowercase(root: Path, quarantine_dir: Path, execute: bool, manifest: list,
-                                      delete_duplicates: bool = False, rename_conflicts: bool = False):
+def plan_and_maybe_execute_normalize(root: Path, quarantine_dir: Path, execute: bool, manifest: list,
+                                      delete_duplicates: bool = False, rename_conflicts: bool = False,
+                                      case_style: str = "lower", sep_style: str = "none"):
     print()
-    print("[case] normalizing file and directory names to lowercase ...")
+    print(f"[case] normalizing file and directory names (case={case_style}, separators={sep_style}) ...")
     stats = {"renamed_files": 0, "renamed_dirs": 0, "merged_files": 0, "quarantined": 0,
              "conflicts": [], "actions": []}
-    lowercase_tree(root, root, quarantine_dir, execute, manifest, stats,
-                    delete_duplicates=delete_duplicates, rename_conflicts=rename_conflicts)
+    normalize_tree(root, root, quarantine_dir, execute, manifest, stats,
+                    delete_duplicates=delete_duplicates, rename_conflicts=rename_conflicts,
+                    case_style=case_style, sep_style=sep_style)
     if not (stats["renamed_files"] or stats["renamed_dirs"] or stats["merged_files"]
             or stats["quarantined"] or stats["conflicts"]):
-        print("Everything is already lowercase.")
+        print("Nothing to normalize - names already match the selected style.")
     return stats
 
 
@@ -685,7 +751,7 @@ def cmd_run(args):
             dir_conflicts = [a for a in dir_actions if a["type"] == "conflict"]
         lc_conflicts = []
         if args.lowercase:
-            lc_stats = plan_and_maybe_execute_lowercase(root, quarantine_dir, False, manifest,
+            lc_stats = plan_and_maybe_execute_normalize(root, quarantine_dir, False, manifest,
                                                           delete_duplicates=args.delete,
                                                           rename_conflicts=args.rename_conflicts)
             lc_conflicts = lc_stats["conflicts"]
@@ -734,7 +800,7 @@ def cmd_run(args):
             dir_renamed = sum(1 for a in dir_actions if a["type"] == "rename")
             dir_conflicts = [a for a in dir_actions if a["type"] == "conflict"]
         if args.lowercase:
-            lc_stats = plan_and_maybe_execute_lowercase(root, quarantine_dir, True, manifest,
+            lc_stats = plan_and_maybe_execute_normalize(root, quarantine_dir, True, manifest,
                                                           delete_duplicates=args.delete,
                                                           rename_conflicts=args.rename_conflicts)
         print()
@@ -792,18 +858,26 @@ def prune_empty_quarantine(quarantine_dir: Path):
         pass  # still has content (unrestored entries or the manifest file)
 
 
-def cmd_restore(args):
-    root = Path(args.root).resolve()
-    quarantine_dir = root / QUARANTINE_DIRNAME
-    manifest_path = quarantine_dir / MANIFEST_NAME
+def restore_manifest_entries(root: Path, quarantine_dir: Path, only_new_paths: set[str] | None = None) -> dict:
+    """Moves quarantined files back to their recorded original_path and
+    prunes the restored entries out of the manifest. only_new_paths=None
+    restores everything restorable; otherwise restores just the entries
+    whose new_path (root-relative, as stored in the manifest) is in the
+    set - used for a single-file restore from the web UI, while the CLI's
+    --restore and the UI's "restore all" both just pass None. Shared so
+    every restore path (CLI and web) stays in exact sync.
 
+    Returns {"restored": [original_path,...], "missing": [...], "conflicts":
+    [...], "already_deleted": N} - missing/conflicts entries are dicts with
+    original_path and new_path, for the caller to report however it likes.
+    """
+    manifest_path = quarantine_dir / MANIFEST_NAME
     if not manifest_path.exists():
-        print(f"No manifest found at {manifest_path}; nothing to restore.")
         prune_empty_quarantine(quarantine_dir)
-        return
+        return {"restored": [], "missing": [], "conflicts": [], "already_deleted": 0}
 
     manifest = normalize_manifest(json.loads(manifest_path.read_text()))
-    restored = 0
+    restored, missing, conflicts = [], [], []
     already_deleted = 0
     # Process in reverse order: a nested rename's original_path assumes its
     # parent directory already has its NEW (lowercased) name, since renames
@@ -815,6 +889,8 @@ def cmd_restore(args):
     restored_flags = [False] * len(manifest)
     for i in reversed(range(len(manifest))):
         entry = manifest[i]
+        if only_new_paths is not None and entry.get("new_path") not in only_new_paths:
+            continue
         if entry.get("type") == "deleted" or entry.get("new_path") is None:
             # permanently deleted (--delete / delete_duplicates), not
             # quarantined - nothing to move back. Left in the manifest as
@@ -824,15 +900,15 @@ def cmd_restore(args):
         src = root / entry["new_path"]
         dest = root / entry["original_path"]
         if not src.exists():
-            print(f"  ! missing file, skipping: {src}")
+            missing.append({"original_path": entry["original_path"], "new_path": entry["new_path"]})
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists():
-            print(f"  ! restore target already exists, skipping: {dest}")
+            conflicts.append({"original_path": entry["original_path"], "new_path": entry["new_path"]})
             continue
         shutil.move(str(src), str(dest))
         restored_flags[i] = True
-        restored += 1
+        restored.append(entry["original_path"])
 
     remaining = [entry for i, entry in enumerate(manifest) if not restored_flags[i]]
     if remaining:
@@ -840,16 +916,35 @@ def cmd_restore(args):
     else:
         manifest_path.unlink(missing_ok=True)
 
-    if already_deleted:
-        print(f"{already_deleted} entr(y/ies) were permanently deleted (not quarantined) "
+    prune_empty_quarantine(quarantine_dir)
+    return {"restored": restored, "missing": missing, "conflicts": conflicts, "already_deleted": already_deleted}
+
+
+def cmd_restore(args):
+    root = Path(args.root).resolve()
+    quarantine_dir = root / QUARANTINE_DIRNAME
+    manifest_path = quarantine_dir / MANIFEST_NAME
+
+    if not manifest_path.exists():
+        print(f"No manifest found at {manifest_path}; nothing to restore.")
+        prune_empty_quarantine(quarantine_dir)
+        return
+
+    result = restore_manifest_entries(root, quarantine_dir)
+
+    for m in result["missing"]:
+        print(f"  ! missing file, skipping: {root / m['new_path']}")
+    for c in result["conflicts"]:
+        print(f"  ! restore target already exists, skipping: {root / c['original_path']}")
+    if result["already_deleted"]:
+        print(f"{result['already_deleted']} entr(y/ies) were permanently deleted (not quarantined) "
               "and cannot be restored - left as a record in the manifest.")
 
-    print(f"Restored {restored} file(s) back to their original locations.")
-    if remaining:
-        print(f"{len(remaining)} entr(y/ies) could not be restored automatically; "
+    print(f"Restored {len(result['restored'])} file(s) back to their original locations.")
+    remaining_count = len(result["missing"]) + len(result["conflicts"])
+    if remaining_count:
+        print(f"{remaining_count} entr(y/ies) could not be restored automatically; "
               "see printed warnings above.")
-
-    prune_empty_quarantine(quarantine_dir)
 
 
 def main():

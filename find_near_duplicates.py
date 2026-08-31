@@ -128,15 +128,30 @@ def group_confidence(hashes: dict[Path, int], members: list[Path]) -> float:
     return sum(dists) / len(dists)
 
 
-def group_by_hash(hashes: dict[Path, int], threshold: int) -> list[list[Path]]:
+def group_by_hash(hashes: dict[Path, int], threshold: int, on_progress=None) -> list[list[Path]]:
     """Union-find clustering: any pair within `threshold` Hamming distance
     joins the same group. Returns groups of size > 1, each sorted by path,
-    ordered by ascending avg. pairwise distance (most confident match first)."""
+    ordered by ascending avg. pairwise distance (most confident match first).
+
+    This is an all-pairs comparison - O(n^2) - unlike compute_hashes, which
+    is linear. For a few hundred images that's negligible, but for a large
+    real collection (tens of thousands of files) it can genuinely take real
+    time, with nothing else useful to report meanwhile (no group is known
+    until every pair has been checked). on_progress(current, total), if
+    given, is called periodically (not every pair - that overhead adds up
+    across tens of millions of iterations) so a caller can at least show
+    that this step is progressing, not frozen, even though nothing else
+    can start until it finishes."""
     paths = list(hashes.keys())
     uf = UnionFind(paths)
-    for a, b in itertools.combinations(paths, 2):
+    total_pairs = len(paths) * (len(paths) - 1) // 2
+    for i, (a, b) in enumerate(itertools.combinations(paths, 2), 1):
         if hamming(hashes[a], hashes[b]) <= threshold:
             uf.union(a, b)
+        if on_progress and total_pairs and i % 50_000 == 0:
+            on_progress(i, total_pairs)
+    if on_progress and total_pairs:
+        on_progress(total_pairs, total_pairs)
 
     clusters: dict[Path, list[Path]] = {}
     for p in paths:
