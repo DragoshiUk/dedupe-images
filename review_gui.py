@@ -828,7 +828,11 @@ PAGE = r"""<!doctype html>
   .modal-body ul { margin:0; padding-left:18px; }
   .modal-body li { padding:2px 0; word-break:break-all; }
   .modal-actions { padding:14px 18px; border-top:1px solid var(--border); display:flex; justify-content:flex-end; gap:10px; }
-  #picker-path { padding:16px 18px; border-bottom:1px solid var(--border); font-size:13px; color:var(--text-dim); word-break:break-all; }
+  /* Fixed height so navigating between directories with different numbers
+     of sub-folders doesn't resize (and re-centre) the whole dialog -
+     #picker-list flexes to fill and scrolls instead. */
+  #picker-overlay .modal { height:min(620px, 82vh); }
+  #picker-path { padding:16px 18px; border-bottom:1px solid var(--border); font-size:13px; color:var(--text-dim); white-space:nowrap; overflow-x:auto; }
   #picker-newrow { display:flex; gap:8px; padding:10px 18px; border-bottom:1px solid var(--border); }
   #picker-newrow input { flex:1; background:var(--bg); color:var(--text); border:1px solid var(--border-strong); border-radius:var(--radius-sm); padding:6px 9px; font-size:13px; }
   #picker-list { overflow-y:auto; flex:1; padding:6px; }
