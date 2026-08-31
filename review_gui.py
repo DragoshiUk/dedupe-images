@@ -444,9 +444,10 @@ def start_scan(state: State, root: Path) -> bool:
 # Combined pending-job building + running
 # ---------------------------------------------------------------------------
 
-def build_identical_items(root: Path, prefer: str, delete_duplicates: bool) -> list[dict]:
+def build_identical_items(root: Path, prefer: str, delete_duplicates: bool,
+                           extensions: set[str]) -> list[dict]:
     quarantine_dir = root / QUARANTINE_DIRNAME
-    plan = plan_file_dedupe(root, DEFAULT_EXTENSIONS, quarantine_dir, prefer)
+    plan = plan_file_dedupe(root, extensions, quarantine_dir, prefer)
     action = "delete" if delete_duplicates else "quarantine"
     items = []
     for entry in plan:
@@ -506,7 +507,7 @@ def do_build_review(root: Path, ops: list[str], prefer: str, rename_conflicts: b
     for op in ordered_ops:
         if op == "identical":
             prog.phase_tick(idx, OP_NAMES[op], 0, 1)
-            items.extend(build_identical_items(root, prefer, delete_duplicates))
+            items.extend(build_identical_items(root, prefer, delete_duplicates, state.extensions))
             prog.phase_tick(idx, OP_NAMES[op], 1, 1)
             idx += 1
         elif op == "normalise":
@@ -548,7 +549,7 @@ def do_run(root: Path, ops: list[str], prefer: str, rename_conflicts: bool, dele
             if op == "identical":
                 prog.phase_tick(idx, f"Running: {OP_NAMES[op]}", 0, 1)
                 quarantine_dir = root / QUARANTINE_DIRNAME
-                plan = plan_file_dedupe(root, DEFAULT_EXTENSIONS, quarantine_dir, prefer)
+                plan = plan_file_dedupe(root, state.extensions, quarantine_dir, prefer)
                 moved = execute_file_dedupe(plan, root, quarantine_dir, manifest,
                                              delete_duplicates=delete_duplicates)
                 result["identical"] = {"processed": moved}
@@ -3092,7 +3093,7 @@ def make_handler(state: State):
                 qs = parse_qs(parsed.query)
                 prefer = qs.get("prefer", ["oldest"])[0]
                 quarantine_dir = root / QUARANTINE_DIRNAME
-                plan = plan_file_dedupe(root, DEFAULT_EXTENSIONS, quarantine_dir, prefer)
+                plan = plan_file_dedupe(root, state.extensions, quarantine_dir, prefer)
                 groups = []
                 total_files = 0
                 total_size = 0
