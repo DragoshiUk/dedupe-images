@@ -133,21 +133,21 @@ GPU upscaling processes one image at a time and can take a while per
 image. Each result is a new file — originals are never modified or
 removed — so unlike the other three operations this has no
 quarantine/manifest/restore involvement at all, and runs immediately from
-its own Start button rather than through Pending Jobs. Two output options:
+its own Upscale button rather than through Pending Jobs. Options:
 
-- **Save to** — alongside each original (default), or a directory you pick
-  anywhere on the filesystem (the picker has a "New folder" field for
-  making one on the spot), in which case the source tree's sub-folders are
-  recreated under it so same-named files in different folders can't
-  collide.
-- **Filename prefix/suffix** — the affix added to each output name
-  (default `_upscaled`), and whether it goes before or after the name.
-  Must be non-empty unless a separate output directory is set, so an
-  upscaled file can never overwrite its original.
-- **Overwrite existing upscaled files** — off by default: a file whose
-  output path already exists is skipped and reported in the run summary,
-  never silently replaced (and in "alongside" mode a file that already
-  carries the affix isn't re-processed). Tick it to replace instead.
+- **Output Directory** — alongside each original (default), or a directory
+  you pick anywhere on the filesystem via **Change** (the picker has a
+  "New folder" field for making one on the spot), in which case the source
+  tree's sub-folders are recreated under it so same-named files in
+  different folders can't collide.
+- **Append to Image Name** — text added to the end of each output
+  filename's stem (default `_upscaled`). Must be non-empty unless a
+  separate output directory is set, so an upscaled file can never
+  overwrite its original.
+- **Overwrite Existing** — off by default: a file whose output path
+  already exists is skipped and reported in the run summary, never
+  silently replaced (and in "alongside" mode a file that already ends with
+  the append text isn't re-processed). Tick it to replace instead.
 
 Needs `realesrgan-ncnn-vulkan`. If it's missing, the command line says so
 at startup and the Upscale tab shows a **Download** button that fetches

@@ -26,7 +26,7 @@ See `README.md` for what each script/mode does and how to run them.
   through the quarantine system. Two things keep "additive" true and must
   stay: the empty-affix guard (only allowed alongside a separate output
   dir), and skipping any file whose output path already exists unless the
-  "Overwrite existing upscaled files" opt-in is ticked.
+  "Overwrite Existing" opt-in is ticked.
 - Keep `README.md` to what it is / how to use it / safety model — no
   debugging narrative, bug writeups, or changelog-style entries. Put
   that kind of detail in commit messages instead.

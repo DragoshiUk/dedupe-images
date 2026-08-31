@@ -22,10 +22,10 @@ Upscale doesn't go through Pending Jobs/Quarantine at all - it never
 moves or deletes anything, it just writes a new file for any image whose
 longest side is under the slider's target resolution (up to 8192px/8K):
 beside the original by default, or into a chosen output directory (source
-sub-folders recreated), with a configurable prefix/suffix on the name. A
+sub-folders recreated), with configurable text appended to each name. A
 file whose output path already exists is skipped and reported unless the
-"Overwrite existing upscaled files" box is ticked. So there's no
-manifest/restore story for it and it has its own direct Start button.
+"Overwrite Existing" box is ticked. So there's no manifest/restore story
+for it and it has its own direct Upscale button.
 Needs realesrgan-ncnn-vulkan; if it's missing the command line says so at
 startup and the Upscale tab offers a one-click download of the portable
 build.
@@ -898,24 +898,26 @@ PAGE = r"""<!doctype html>
   .quarantine-status .big { font-size:24px; font-weight:800; margin-bottom:6px; }
 
   /* ---------- upscale ---------- */
-  .upscale-slider-row { display:flex; align-items:center; gap:14px; padding:16px 18px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); margin-bottom:12px; flex-wrap:wrap; }
-  .upscale-slider-row label { font-weight:600; font-size:13.5px; white-space:nowrap; }
-  .upscale-slider-row input[type=range] { flex:1; min-width:220px; accent-color:var(--accent); height:6px; cursor:pointer; }
   .upscale-target-value { color:var(--accent); font-weight:700; }
   .upscale-summary { color:var(--text-dim); font-size:13px; margin-bottom:14px; }
-  /* Start button sits top-right on its own row, just above the scroll box */
+  /* All controls in one box: target / output dir / append-text */
+  .upscale-controls { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:14px 18px; margin-bottom:14px; display:flex; flex-direction:column; gap:12px; }
+  .upscale-ctl { display:flex; align-items:center; gap:12px; flex-wrap:wrap; font-size:13px; }
+  .upscale-ctl > label { font-weight:600; font-size:13.5px; white-space:nowrap; }
+  .upscale-ctl input[type=range] { flex:1; min-width:200px; accent-color:var(--accent); height:6px; cursor:pointer; }
+  .upscale-ctl input[type=text] { flex:1; max-width:280px; background:var(--bg); color:var(--text); border:1px solid var(--border-strong); border-radius:var(--radius-sm); padding:6px 9px; font-size:13px; }
+  .upscale-outdir-val { flex:1; min-width:40px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--text-dim); }
+  .upscale-ctl .upscale-cb { display:flex; align-items:center; gap:6px; font-weight:600; white-space:nowrap; cursor:pointer; }
+  .upscale-ctl .link-btn { background:none; border:none; color:var(--accent); font-weight:700; cursor:pointer; font-size:13px; padding:0; white-space:nowrap; }
+  .upscale-ctl .link-btn:hover { text-decoration:underline; }
+  /* Upscale button sits top-right on its own row, just above the scroll box */
   .upscale-run-row { display:flex; align-items:center; gap:12px; margin-bottom:12px; }
   .upscale-run-row .upscale-summary { flex:1; min-width:0; margin-bottom:0; }
   .upscale-run-row .spacer-note { color:var(--text-faint); font-size:12px; }
   .upscale-run-row .btn { flex-shrink:0; }
-  /* Eligible-image list capped at ~5 rows (~72px each + 8px gap), then scrolls */
-  .upscale-thumb-scroll { max-height:400px; overflow-y:auto; padding:2px; }
-  .upscale-opt-row { display:flex; align-items:center; gap:10px; padding:12px 18px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); margin-bottom:12px; flex-wrap:wrap; font-size:13px; }
-  .upscale-opt-row > label:first-child { font-weight:600; font-size:13.5px; white-space:nowrap; }
-  .upscale-opt-row input[type=text] { background:var(--bg); color:var(--text); border:1px solid var(--border-strong); border-radius:var(--radius-sm); padding:6px 9px; font-size:13px; }
-  .upscale-opt-row select { background:var(--surface); color:var(--text); border:1px solid var(--border-strong); border-radius:var(--radius-sm); padding:6px 9px; font-size:13px; }
-  .upscale-opt-row code { background:var(--bg); padding:2px 6px; border-radius:4px; font-size:12px; word-break:break-all; }
-  .upscale-opt-row .dim { color:var(--text-faint); font-size:12px; }
+  /* Eligible-image list fills to the bottom of the viewport (max-height set
+     from JS on render + resize); the CSS value is just a pre-JS fallback. */
+  .upscale-thumb-scroll { max-height:60vh; overflow-y:auto; padding:2px; }
   .job-log { text-align:left; margin:14px 0 0; max-height:190px; overflow-y:auto; background:var(--bg); border:1px solid var(--border); border-radius:var(--radius-sm); padding:10px 12px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px; line-height:1.5; color:var(--text-dim); white-space:pre-wrap; word-break:break-all; }
   .warn-box { background:var(--danger-bg); border:1px solid var(--danger-border); border-radius:var(--radius); padding:14px 16px; color:#f2b6b9; font-size:13px; margin-bottom:12px; }
   .warn-box b { color:#ffcdcf; }
@@ -1245,7 +1247,6 @@ async function startAllTabLoads() {
   // next one. Nulls make loadUpscale() re-pull the server defaults.
   upscaleOutDir = null;
   upscaleAffix = null;
-  upscaleAffixPos = 'suffix';
   upscaleOverwrite = false;
   upscaleTarget = null;
   ndGroups = [];
@@ -2145,6 +2146,9 @@ function startMomentum(track, velocity) {
 // on elements that get thrown away and re-created every render) - safe to
 // call even when #cards doesn't currently exist, it just no-ops
 window.addEventListener('resize', updateCarouselArrows);
+// keep the Upscale eligible list reaching the viewport bottom (no-ops when
+// that box isn't on screen)
+window.addEventListener('resize', sizeUpscaleScroll);
 
 function ndToggle(path) {
   ndPending[path] = ndPending[path] === 'keep' ? 'discard' : 'keep';
@@ -2487,8 +2491,7 @@ function wireNormaliseToolbar() {
 
 let upscaleData = null;      // raw preview payload from the last scan
 let upscaleTarget = null;    // slider value - null until the first load pulls default_target
-let upscaleAffix = null;     // filename affix text - null until the first load pulls default_affix
-let upscaleAffixPos = 'suffix';  // 'suffix' (append) | 'prefix' (prepend)
+let upscaleAffix = null;     // text appended to each output filename - null until first load pulls default_affix
 let upscaleOutDir = null;    // null = alongside each original; else an absolute directory
 let upscaleOverwrite = false; // replace an output file that already exists, instead of skipping it
 let upscaleSliderDebounce = null;
@@ -2503,19 +2506,23 @@ function upscaleOutputOk() {
   return !!(upscaleAffix || outDirDistinct);
 }
 
-// "photo.jpg" -> what the affix + position would name it
-function upscaleExampleName() {
-  const a = upscaleAffix || '';
-  return (upscaleAffixPos === 'prefix' ? a + 'photo' : 'photo' + a) + '.jpg';
-}
-
-// In alongside mode (no output dir), a file that already carries the affix
-// is a previous run's own output - server-side run_upscale skips it too,
-// so keep the eligible list in step.
+// In alongside mode (no output dir), a file that already ends with the
+// appended text is a previous run's own output - server-side run_upscale
+// skips it too, so keep the eligible list in step.
 function upscaleNameIsAffixed(path) {
   if (!upscaleAffix || upscaleOutDir) return false;
   const stem = path.split('/').pop().replace(/\.[^./]*$/, '');
-  return upscaleAffixPos === 'prefix' ? stem.startsWith(upscaleAffix) : stem.endsWith(upscaleAffix);
+  return stem.endsWith(upscaleAffix);
+}
+
+// The eligible list grows to the bottom of the viewport rather than a
+// fixed row count - measured live so it survives resizes and re-renders.
+function sizeUpscaleScroll() {
+  const box = document.querySelector('.upscale-thumb-scroll');
+  if (!box) return;
+  const top = box.getBoundingClientRect().top;
+  // leave room for <main>'s 64px bottom padding so the page itself doesn't scroll
+  box.style.maxHeight = Math.max(160, window.innerHeight - top - 72) + 'px';
 }
 
 async function loadUpscale() {
@@ -2554,14 +2561,11 @@ function updateUpscaleEligibleSection(data, target) {
   if (startBtn) startBtn.disabled = !!data.tool_error || eligible.length === 0 || !upscaleOutputOk();
   const hint = document.getElementById('upscale-start-hint');
   if (hint) hint.textContent = (!data.tool_error && !upscaleOutputOk())
-    ? 'Set a filename prefix/suffix or a separate output directory first.' : '';
+    ? 'Set an append text or an output directory first.' : '';
 
-  const hiddenN = data.images.length - eligible.length;
   const summaryEl = document.getElementById('upscale-summary');
-  if (summaryEl) summaryEl.innerHTML =
-    `${plural(eligible.length, 'image')} below ${target}px on their longest side` +
-    (eligible.length ? ' - eligible for upscaling.' : '.') +
-    (hiddenN > 0 ? ` (${plural(hiddenN, 'other image')} not shown - already large enough, or an existing ${esc(upscaleAffix || '_upscaled')} output.)` : '');
+  if (summaryEl) summaryEl.textContent =
+    `${eligible.length} ${eligible.length === 1 ? 'Image' : 'Images'} Eligible for Upscaling to ${target}px`;
 
   let html = '';
   if (eligible.length >= UPSCALE_WARN_THRESHOLD) {
@@ -2569,7 +2573,7 @@ function updateUpscaleEligibleSection(data, target) {
   }
 
   if (eligible.length === 0) {
-    html += `<div class="empty">${data.images.length === 0 ? 'No images found in this directory.' : `Nothing to upscale at ${target}px - every image is already at least that large, or is an existing ${esc(upscaleAffix || '_upscaled')} output.`}</div>`;
+    html += `<div class="empty">${data.images.length === 0 ? 'No images found in this directory.' : `Nothing below ${target}px to upscale.`}</div>`;
     section.innerHTML = html;
     return;
   }
@@ -2587,6 +2591,7 @@ function updateUpscaleEligibleSection(data, target) {
   });
   html += '</div>';
   section.innerHTML = html;
+  sizeUpscaleScroll();
 }
 
 function renderUpscale(data) {
@@ -2607,39 +2612,29 @@ function renderUpscale(data) {
     </div>`;
   }
 
-  html += `<div class="upscale-slider-row">
-    <label for="upscale-target">Target longest side: <span class="upscale-target-value" id="upscale-target-value">${upscaleTarget}px</span></label>
-    <input type="range" id="upscale-target" min="${data.min_target}" max="${data.max_target}" step="1" value="${upscaleTarget}">
-    <button class="btn" id="upscale-rescan">Rescan</button>
-  </div>`;
-
-  const outLabel = upscaleOutDir
-    ? `<code>${esc(upscaleOutDir)}</code> <span class="dim">(source sub-folders recreated inside)</span>`
-    : 'Alongside each original image';
-  html += `<div class="upscale-opt-row">
-    <label>Save to:</label>
-    <span id="upscale-outdir-label">${outLabel}</span>
-    <button class="btn btn-sm" id="upscale-outdir-pick">Choose directory&hellip;</button>
-    ${upscaleOutDir ? '<button class="btn btn-sm" id="upscale-outdir-reset">Reset to default</button>' : ''}
-  </div>
-  <div class="upscale-opt-row">
-    <label id="upscale-affix-label" for="upscale-affix">Filename ${upscaleAffixPos === 'prefix' ? 'prefix' : 'suffix'}:</label>
-    <input type="text" id="upscale-affix" value="${esc(upscaleAffix)}" spellcheck="false" style="width:150px">
-    <select id="upscale-affix-pos">
-      <option value="suffix"${upscaleAffixPos === 'suffix' ? ' selected' : ''}>Append (after name)</option>
-      <option value="prefix"${upscaleAffixPos === 'prefix' ? ' selected' : ''}>Prepend (before name)</option>
-    </select>
-    <span class="dim">e.g. <code id="upscale-affix-example">photo.jpg &rarr; ${esc(upscaleExampleName())}</code></span>
-  </div>
-  <div class="upscale-opt-row">
-    <label style="font-weight:400;cursor:pointer"><input type="checkbox" id="upscale-overwrite" ${upscaleOverwrite ? 'checked' : ''}> Overwrite existing upscaled files</label>
-    <span class="dim">off: a file whose output already exists is skipped and reported, not replaced</span>
+  const outVal = upscaleOutDir || 'Alongside each original image';
+  html += `<div class="upscale-controls">
+    <div class="upscale-ctl">
+      <label for="upscale-target">Resolution Target: <span class="upscale-target-value" id="upscale-target-value">${upscaleTarget}px</span></label>
+      <input type="range" id="upscale-target" min="${data.min_target}" max="${data.max_target}" step="1" value="${upscaleTarget}">
+      <button class="btn btn-sm" id="upscale-rescan">Rescan</button>
+    </div>
+    <div class="upscale-ctl">
+      <label>Output Directory:</label>
+      <span class="upscale-outdir-val" id="upscale-outdir-label" title="${esc(outVal)}">${esc(outVal)}</span>
+      <label class="upscale-cb">Overwrite Existing:<input type="checkbox" id="upscale-overwrite" ${upscaleOverwrite ? 'checked' : ''}></label>
+      <button class="link-btn" id="upscale-outdir-pick">Change</button>
+    </div>
+    <div class="upscale-ctl">
+      <label for="upscale-affix">Append to Image Name:</label>
+      <input type="text" id="upscale-affix" value="${esc(upscaleAffix)}" spellcheck="false">
+    </div>
   </div>`;
 
   html += `<div class="upscale-run-row">
     <div class="upscale-summary" id="upscale-summary"></div>
     <span class="spacer-note" id="upscale-start-hint"></span>
-    <button class="btn btn-primary btn-lg" id="upscale-start" ${data.tool_error ? 'disabled' : ''}>Start Upscale</button>
+    <button class="btn btn-primary btn-lg" id="upscale-start" ${data.tool_error ? 'disabled' : ''}>Upscale</button>
   </div>
   <div id="upscale-eligible-section"></div>`;
   panel.innerHTML = html;
@@ -2668,22 +2663,11 @@ function renderUpscale(data) {
     allowCreate: true,
     onChoose: (path) => { upscaleOutDir = path; loadUpscale(); },
   });
-  const resetBtn = document.getElementById('upscale-outdir-reset');
-  if (resetBtn) resetBtn.onclick = () => { upscaleOutDir = null; loadUpscale(); };
 
-  const affixInput = document.getElementById('upscale-affix');
-  const affixPos = document.getElementById('upscale-affix-pos');
-  function syncAffix() {
-    upscaleAffix = affixInput.value;
-    upscaleAffixPos = affixPos.value;
-    document.getElementById('upscale-affix-label').textContent =
-      'Filename ' + (upscaleAffixPos === 'prefix' ? 'prefix' : 'suffix') + ':';
-    document.getElementById('upscale-affix-example').innerHTML =
-      'photo.jpg &rarr; ' + esc(upscaleExampleName());
-    updateUpscaleEligibleSection(upscaleData, upscaleTarget);  // Start disabled/hint depend on the affix
-  }
-  affixInput.oninput = syncAffix;
-  affixPos.onchange = syncAffix;
+  document.getElementById('upscale-affix').oninput = (e) => {
+    upscaleAffix = e.target.value;
+    updateUpscaleEligibleSection(upscaleData, upscaleTarget);  // Start disabled/hint depend on the append text
+  };
   document.getElementById('upscale-overwrite').onchange = (e) => { upscaleOverwrite = e.target.checked; };
 
   document.getElementById('upscale-start').onclick = async () => {
@@ -2691,21 +2675,24 @@ function renderUpscale(data) {
     const where = upscaleOutDir
       ? `into <code>${esc(upscaleOutDir)}</code> (source sub-folders recreated)`
       : 'next to each original';
+    const naming = upscaleAffix
+      ? `with "<code>${esc(upscaleAffix)}</code>" appended to each name`
+      : 'keeping the same filename';
     const existing = upscaleOverwrite
       ? '<p>An output file that already exists <b>will be overwritten</b>.</p>'
       : '<p>A file whose output already exists is skipped (and reported), not replaced.</p>';
     confirmAction('Start upscaling',
-      `<p>${plural(eligible.length, 'image')} below ${upscaleTarget}px will be upscaled to that size on their longest side, saved ${where} with <code>${esc(upscaleExampleName())}</code>-style names. Originals are never touched.</p>
+      `<p>${plural(eligible.length, 'image')} below ${upscaleTarget}px will be upscaled to that size on their longest side, saved ${where} ${naming}. Originals are never touched.</p>
        ${existing}
        <p>This runs on the GPU and can take a while - the page shows progress as it goes.</p>`,
       async () => {
         const result = await runJob('Upscaling images&hellip;', '/api/upscale/run',
           {target: upscaleTarget, out_dir: upscaleOutDir || '', affix: upscaleAffix,
-           affix_pos: upscaleAffixPos, overwrite: upscaleOverwrite});
+           affix_pos: 'suffix', overwrite: upscaleOverwrite});
         if (result === null) return;
         let msg = `Upscaled ${plural(result.processed, 'image')}.`;
         if (result.skipped && result.skipped.length)
-          msg += ` ${plural(result.skipped.length, 'image')} skipped - output already exists (tick "Overwrite existing upscaled files" to replace them).`;
+          msg += ` ${plural(result.skipped.length, 'image')} skipped - output already exists (tick "Overwrite Existing" to replace them).`;
         if (result.errors.length) msg += ` ${plural(result.errors.length, 'image')} failed - see the server console for details.`;
         alert(msg);
         loadUpscale();
@@ -3476,7 +3463,7 @@ def make_handler(state: State):
                 # when output lands in the source location AND the affix is
                 # empty, so nothing distinguishes the copy from its source.
                 if not affix and (out_dir is None or out_dir == root):
-                    self._json({"ok": False, "error": "set a filename prefix/suffix, or a separate output directory, so upscaled files don't overwrite the originals"}, status=400)
+                    self._json({"ok": False, "error": "set an append text, or a separate output directory, so upscaled files don't overwrite the originals"}, status=400)
                     return
 
                 def work(prog):
