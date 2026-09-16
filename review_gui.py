@@ -1881,6 +1881,50 @@ function wireVisualRescan() {
   };
 }
 
+// One-click "quick and dirty" review: keep each group's badged
+// "suggested" image (highest resolution, then sharpness, then file size)
+// and stage the rest to discard, across every group at once. The result
+// is an ordinary decision snapshot - nothing moves until Visually Similar
+// is added to Pending Jobs and run - this just fills the snapshot in
+// automatically instead of clicking through group by group.
+function ndAutoSuggestRowHtml() {
+  if (ndGroups.length === 0) return '';
+  const undecided = ndGroups.filter(g => !ndDecisions[g.id]).length;
+  const label = undecided === 0
+    ? 'Auto-select suggested (redo all groups)'
+    : undecided === ndGroups.length
+      ? 'Auto-select suggested (all groups)'
+      : `Auto-select suggested (${plural(undecided, 'remaining group')})`;
+  return `<div class="toolbar"><button class="btn" id="nd-auto-suggest" ${scanActive ? 'disabled' : ''}>${label}</button>
+    <span class="spacer-note">quick dedupe &mdash; keeps the highest-resolution image in each group</span></div>`;
+}
+function wireNdAutoSuggest() {
+  const btn = document.getElementById('nd-auto-suggest');
+  if (!btn) return;
+  btn.onclick = () => {
+    const undecided = ndGroups.filter(g => !ndDecisions[g.id]).length;
+    const overwrite = undecided === 0;
+    let scope;
+    if (overwrite) scope = `all ${plural(ndGroups.length, 'group')}, replacing every decision you've already made`;
+    else if (undecided === ndGroups.length) scope = `all ${plural(ndGroups.length, 'group')}`;
+    else scope = `the ${plural(undecided, 'group')} you haven't reviewed yet (groups you've already decided are left alone)`;
+    confirmAction('Auto-select suggested',
+      `<p>This keeps the <b>suggested</b> image (highest resolution, then sharpness, then file size) in ${scope} and stages every other image in the group to discard.</p>` +
+      `<p>Only your review progress changes &mdash; nothing moves until you add Visually Similar to Pending Jobs and run it.</p>`,
+      async () => {
+        const r = await fetch('/api/nd/auto-suggest', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({overwrite})
+        });
+        const result = await r.json();
+        if (!result.ok) { alert(result.error || 'auto-select failed'); return; }
+        await loadVisualData();
+        updateJobsBadge();
+      },
+      { confirmLabel: 'Auto-select' });
+  };
+}
+
 function renderVisual() {
   const panel = document.getElementById('sub-visual');
   const discardCount = ndDiscardTotal();
@@ -1891,6 +1935,7 @@ function renderVisual() {
   const toggle = pendingToggleHtml('visual', noGroups,
     noGroups ? 'Nothing to review' : discardCount === 0 ? 'No decisions yet' : `${plural(discardCount, 'file')} staged to discard`);
   const rescanRow = visualRescanRowHtml();
+  const autoRow = ndAutoSuggestRowHtml();
 
   if (ndGroups.length === 0) {
     const emptyMsg = scanActive
@@ -1904,9 +1949,10 @@ function renderVisual() {
   const decidedCount = Object.keys(ndDecisions).length;
   const resetRow = ndResetRowHtml(decidedCount);
   if (decidedCount === ndGroups.length) {
-    panel.innerHTML = `<h2 class="page-title">Visually Similar</h2>${toggle}${rescanRow}${resetRow}<div class="empty">All groups reviewed! ${plural(discardCount, 'file')} staged to discard.<br><span class="empty-hint">Add to Pending Jobs above, then go to the Jobs tab to run it.</span></div>`;
+    panel.innerHTML = `<h2 class="page-title">Visually Similar</h2>${toggle}${rescanRow}${autoRow}${resetRow}<div class="empty">All groups reviewed! ${plural(discardCount, 'file')} staged to discard.<br><span class="empty-hint">Add to Pending Jobs above, then go to the Jobs tab to run it.</span></div>`;
     wirePendingToggle('visual');
     wireVisualRescan();
+    wireNdAutoSuggest();
     wireNdReset();
     return;
   }
@@ -1916,7 +1962,7 @@ function renderVisual() {
 
   const groupKeepCount = g.images.filter(im => ndPending[im.path] !== 'discard').length;
   const groupDiscardCount = g.images.length - groupKeepCount;
-  let html = `<h2 class="page-title">Visually Similar</h2>${toggle}${rescanRow}${resetRow}
+  let html = `<h2 class="page-title">Visually Similar</h2>${toggle}${rescanRow}${autoRow}${resetRow}
     <div id="progress-track"><div class="bar"><div class="bar-fill" style="width:${100*decidedCount/ndGroups.length}%"></div></div>
     <div id="progress-label">${decidedCount} / ${ndGroups.length} decided &mdash; viewing group ${ndIdx+1}</div></div>
     <div class="nd-stats">
@@ -1955,6 +2001,7 @@ function renderVisual() {
   panel.innerHTML = html;
   wirePendingToggle('visual');
   wireVisualRescan();
+  wireNdAutoSuggest();
   wireNdReset();
 
   panel.querySelectorAll('.card').forEach(card => {
@@ -3522,6 +3569,36 @@ def make_handler(state: State):
                     state.decisions = {}
                     save_decisions(state.decisions_path, state.decisions)
                 self._json({"ok": True})
+                return
+
+            if path == "/api/nd/auto-suggest":
+                # "Quick and dirty" one-click review: for every candidate
+                # group, keep the badged "suggested" image (highest
+                # resolution, then sharpness, then size - see
+                # score_one_group) and discard the rest. Still only produces
+                # a decision snapshot - nothing moves until Pending Jobs is
+                # run, exactly like a hand-made decision. overwrite=False
+                # (default) leaves any group you've already decided by hand
+                # untouched; overwrite=True redecides every group.
+                with state.lock:
+                    if state.root is None:
+                        self._json({"ok": False, "error": "no directory chosen"}, status=400)
+                        return
+                    overwrite = bool(body.get("overwrite"))
+                    decided = 0
+                    for group in state.groups:
+                        gid = group["id"]
+                        if not overwrite and gid in state.decisions:
+                            continue
+                        keep = [im["path"] for im in group["images"] if im.get("suggested")]
+                        if not keep:
+                            continue
+                        discard = [im["path"] for im in group["images"] if not im.get("suggested")]
+                        state.decisions[gid] = {"keep": keep, "discard": discard,
+                                                "skipped": False, "decided_at": now_iso()}
+                        decided += 1
+                    save_decisions(state.decisions_path, state.decisions)
+                self._json({"ok": True, "decided": decided})
                 return
 
             if path == "/api/nd/rescan":

@@ -119,21 +119,32 @@ a live keep/discard split as you toggle. `Prev`/`Next` (also the arrow
 keys, or `Enter` for next) always save the current group's keep/discard
 split before moving — even if you didn't touch anything, so browsing past
 a group can never silently leave it undecided; `S` skips without
-deciding. Decisions save to disk as you go; actually running them happens
-later, from Pending Jobs. **Rescan** re-walks the directory from scratch
+deciding. **Auto-select suggested** is the quick-and-dirty shortcut: one
+click keeps the "suggested" image in every group and stages the rest to
+discard, instead of clicking through group by group — it still only
+produces a decision snapshot you run later from Pending Jobs, and by
+default it leaves any group you've already decided by hand untouched
+(once every group is decided, the same button re-runs across all of them,
+replacing your existing decisions). Decisions save to disk as you go;
+actually running them happens later, from Pending Jobs. **Rescan**
+re-walks the directory from scratch
 (picks up anything added, removed, or quarantined since the last scan),
 restoring prior decisions for any group it rediscovers unchanged.
 
 **Operations → Upscale** — AI-upscales images (Real-ESRGAN on the GPU) so
 their longest side reaches a **Resolution Target** you set with a slider
-(up to 8192px/8K), preserving aspect ratio; an image already at or above
-the target isn't touched or listed. The eligible list updates live as you
-drag the slider. A warning appears once a lot of images are queued, since
-GPU upscaling processes one image at a time and can take a while per
-image. Each result is a new file — originals are never modified or
-removed — so unlike the other three operations this has no
+(512–8192px, default 4096), preserving aspect ratio; an image already at
+or above the target isn't touched or listed. The eligible list updates
+live as you drag the slider. A warning appears once a lot of images are
+queued, since GPU upscaling processes one image at a time and can take a
+while per image. Each result is a new file — originals are never modified
+or removed — so unlike the other three operations this has no
 quarantine/manifest/restore involvement at all, and runs from its own
-**Upscale** button rather than through Pending Jobs. Options:
+**Upscale** button rather than through Pending Jobs. Only png/jpg/jpeg/webp
+are eligible — narrower than the gif/bmp/tif/tiff the rest of the app also
+handles. An image already within about 1.5x of the target skips the GPU
+pass entirely and gets a plain high-quality resize instead — AI upscaling
+isn't worth its cost that close to the target. Options:
 
 - **Output Directory** — alongside each original (default), or a directory
   you pick anywhere on the filesystem via **Change** (the picker has a
@@ -169,10 +180,17 @@ a library module for `review_gui.py` only, not a standalone command-line
 tool.
 
 **Operations → Normalisation** — directory-merge (`Foo`+`Foo_1` sibling
-folders) and lowercase-renaming, combined into one read-only preview.
-"Rename conflicting file names" toggles the preview between the default
-(leave a genuine content conflict alone, flagged) and the opt-in
+folders) and file/directory name normalization, combined into one
+read-only preview. Two independent dropdowns control the renaming:
+**Case** (unchanged / lowercase / camelCase) and **Separators**
+(unchanged, or convert spaces↔dashes, spaces↔underscores,
+dashes↔underscores) — leave either on "unchanged" to skip that axis
+entirely. "Rename conflicting file names" toggles the preview between the
+default (leave a genuine content conflict alone, flagged) and the opt-in
 resolution (rename the incoming file to a unique name so both survive).
+The CLI's `--lowercase` flag only ever applies lowercase-case with
+unchanged separators — camelCase and separator conversion are GUI-only
+for now.
 
 **Enabling an operation happens on its own Operations tab**, not on Jobs —
 each of the three (Identical Files, Visually Similar, Normalisation) has
@@ -229,6 +247,8 @@ only, never reachable from the network.
 uv run review_gui.py /path/to/images
 # --threshold N     Visually-Similar Hamming distance out of 64, default 8
 # --port N          default 8765
+# --ext EXT [EXT ...]  extensions for Identical Files/Visually Similar (default: png, jpg,
+#                       jpeg, gif, bmp, webp, tif, tiff); Normalisation always considers all files
 # --no-browser      don't try to auto-open a tab
 ```
 
