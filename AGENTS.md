@@ -80,3 +80,12 @@ See `README.md` for what each script/mode does and how to run them.
 - Keep `README.md` to what it is / how to use it / safety model — no
   debugging narrative, bug writeups, or changelog-style entries. Put
   that kind of detail in commit messages instead.
+
+## upscale-to-max.sh
+
+Standalone bash upscaler, folded in from the retired `max-side-upscale`
+repo on 2026-11-06. Independent of `upscale.py` (the GUI's library): it
+shells out to `realesrgan-ncnn-vulkan` with `-s 2/3/4` where `upscale.py`
+uses native 4x only, because `-s` is not native to the x4plus model and
+can corrupt tile stitching there. If that bites the script too, align it
+with `upscale.py`. GPU tooling tested on an RTX 4080 SUPER.

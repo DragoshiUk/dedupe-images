@@ -302,6 +302,32 @@ uv run find_near_duplicates.py /path/to/images
 # --threshold N, --montage-dir DIR, --no-montage
 ```
 
+## upscale-to-max.sh (standalone CLI upscale)
+
+The GUI's Upscale tab as a shell script, for scripting or a quick batch
+without the browser (folded in from the former `max-side-upscale` repo).
+Resizes image(s) so the longest side hits a target pixel size (default
+4096px), aspect ratio preserved: an image already at or above the target
+gets one Lanczos3 downsample with `vips`; a smaller one runs Real-ESRGAN
+(`realesrgan-ncnn-vulkan`, GPU) at the smallest integer factor that
+covers the gap, chains a second 4x pass for extreme scale-ups, then one
+final Lanczos3 resample to the exact target. Default model is
+`realesrgan-x4plus-anime`; `realesrgan-x4plus` (photos) and
+`realesr-animevideov3` are available via `-m`. Needs the AUR
+`realesrgan-ncnn-vulkan` package (models in
+`/usr/share/realesrgan-ncnn-vulkan/models`) and `vips`. Harmless
+`vips-openslide.so` warnings on stderr are vips looking for an optional
+plugin.
+
+```bash
+./upscale-to-max.sh [-s SIZE] [-m MODEL] [-o OUTDIR] INPUT...
+./upscale-to-max.sh photo.png                                   # 4096px, anime model
+./upscale-to-max.sh -s 3000 -m realesrgan-x4plus -o ./out ./dir # folder, photo model
+```
+
+`INPUT` is one or more files and/or directories (recursed; png/jpg/jpeg/
+webp). Output defaults to `<name>_upscaled.<ext>` beside each input.
+
 ## apply_review.py (standalone apply)
 
 Reads `<root>/_near_duplicate_review/decisions.json` (written by either
